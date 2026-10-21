@@ -1,0 +1,6 @@
+{
+  "name": "@genie/shared",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./api.ts" }
+}

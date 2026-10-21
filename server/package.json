@@ -1,0 +1,24 @@
+{
+  "name": "@genie/server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "GENIE_DEV=1 tsx watch --clear-screen=false src/index.ts",
+    "start": "tsx src/index.ts",
+    "check": "GENIE_DEV=1 tsx check.ts",
+    "check:unfurl": "tsx check-unfurl.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@genie/shared": "*",
+    "bcryptjs": "^3.0.3",
+    "node-html-parser": "^7.0.1",
+    "pg": "^8.23.1",
+    "tsx": "^4.23.15"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.23.1",
+    "typescript": "^7.0.2"
+  }
+}
