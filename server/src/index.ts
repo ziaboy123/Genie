@@ -36,7 +36,10 @@ async function sendIndex(req: IncomingMessage, res: ServerResponse, rel: string)
       const title = escapeHtml(`${meta.title}`), desc = escapeHtml(`${meta.ownerName}'s wishlist on Genie · ${meta.count} ${meta.count === 1 ? 'wish' : 'wishes'}`);
       // replacer functions: a replacement string would expand $& $` $$ in the owner's title or name ("Gifts under $`10" copied the head in)
       html = html.replace(/<title>[^<]*<\/title>/, () => `<title>${title} · Genie</title>`)
-        .replace('</head>', () => `<meta property="og:title" content="${title}"><meta property="og:description" content="${desc}"><meta property="og:type" content="website"><meta name="robots" content="noindex, nofollow"></head>`);
+        // the page already has Genie's own preview tags (and its picture): swap in the list's title and description
+        .replace(/<meta property="og:title" content="[^"]*">/, () => `<meta property="og:title" content="${title}">`)
+        .replace(/<meta property="og:description" content="[^"]*">/, () => `<meta property="og:description" content="${desc}">`)
+        .replace('</head>', () => '<meta name="robots" content="noindex, nofollow"></head>');
     }
   }
   res.writeHead(200, { 'content-type': TYPES['.html'], 'cache-control': 'no-cache' });

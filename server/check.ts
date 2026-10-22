@@ -328,7 +328,11 @@ async function main() {
   const page = await fetch(`${BASE}/w/${cleared.shareCode}`);
   if (page.status === 200 && /<html/i.test(await page.clone().text())) {
     const html = await page.text();
-    assert.match(html, /og:title/);
+    // a list's own title replaces Genie's, once, and Genie's preview picture stays
+    const listTitle = (t: string) => `<meta property="og:title" content="${t.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`)}">`;
+    assert.ok(html.includes(listTitle(cleared.title)), 'the list\'s own og:title');
+    assert.equal(html.match(/og:title/g)?.length, 1, 'one og:title');
+    assert.match(html, /og:image" content="https:\/\/daniyalzia\.co\.uk\/genie\/og\.png"/);
     assert.equal(page.headers.get('x-robots-tag'), 'noindex, nofollow');
     // $ patterns in a title are just text (a replacement string once pasted the page's own head into it)
     for (const t of ["a $' b", 'a $` b', 'a $& b $$ c']) {
@@ -340,6 +344,7 @@ async function main() {
       assert.ok(h.includes(`<title>${esc} · Genie</title>`), `<title> for ${t}`);
       assert.ok(h.includes(`<meta property="og:title" content="${esc}">`), `og:title for ${t}`);
       assert.equal(h.match(/<head>/g)?.length, 1, `one <head> for ${t}`);
+      assert.equal(h.match(/og:title/g)?.length, 1, `one og:title for ${t}`);
     }
     // whether a preview is there says whether a code is real, so looking codes up is limited per visitor like opening
     // a list (300 per 15 minutes): past that the page still loads, just without a preview
@@ -349,9 +354,9 @@ async function main() {
       await Promise.all(guesses.slice(i, i + 25).map(async g => (await fetch(`${BASE}/w/${g}`, { headers: prober })).text()));
     const over = await fetch(`${BASE}/w/${cleared.shareCode}`, { headers: prober });
     assert.equal(over.status, 200, 'the page still loads');
-    assert.ok(!/og:title/.test(await over.text()), 'no preview past the limit, even for a real code');
+    assert.ok(!(await over.text()).includes(listTitle(cleared.title)), "past the limit the page only has Genie's own preview, even for a real code");
     const someoneElse = await (await fetch(`${BASE}/w/${cleared.shareCode}`, { headers: { 'cf-connecting-ip': '203.0.113.51' } })).text();
-    assert.match(someoneElse, /og:title/, 'other visitors still get previews');
+    assert.ok(someoneElse.includes(listTitle(cleared.title)), 'other visitors still get the list\'s preview');
     section('Link previews');
   } else console.log('(client not built: skipped link previews)');
 
