@@ -81,13 +81,13 @@ export function Privacy() {
 
       <h2>Who can see your list</h2>
       <p>Anyone with your list's share link can see your name, the list's name and date, and its wishes. When the link is sent in WhatsApp, iMessage and similar apps, the preview shows the list's name, your name and how many wishes it has.</p>
-      <p>Lists can't be found any other way: there's no search or public directory, and they're hidden from search engines. If a link ends up somewhere it shouldn't, make a new one in the editor and the old one stops working. You never see who granted a wish. While you're logged in, Genie hides what's been granted until the day after the list's date (the link is the same for everyone, so it works on trust).</p>
+      <p>Lists can't be found any other way: there's no search or public directory, and they're hidden from search engines. If a link ends up somewhere it shouldn't, make a new one in the editor and the old one stops working. You can clear every grant at the same time, in case someone used the old link to mark wishes as granted (this doesn't tell you which ones were). You never see who granted a wish. While you're logged in, Genie hides what's been granted until the day after the list's date (the link is the same for everyone, so it works on trust).</p>
 
       <h2>Reading the links you paste</h2>
       <p>When you add a link, Genie's server visits that page once to read the product's name and price. The shop sees one visit from Genie's server, which says it's "GenieBot", not from you or the people you share with. When people open your list, nothing is loaded from shops. If they tap a wish, the shop's page opens in their browser like any other link, and Genie doesn't tell the shop where they came from.</p>
 
       <h2>Spam and security</h2>
-      <p>To slow down password guessing and spam, Genie counts recent attempts by IP address (and, for sign-ups, logins and password resets, by email address). These counts are kept only in the server's memory and are forgotten within about an hour. Genie's server doesn't keep a log of visits.</p>
+      <p>To slow down password guessing and spam, Genie counts recent attempts by IP address (and, for sign-ups, logins and password resets, by email address). These counts are kept only in the server's memory and are forgotten within about an hour, except how many wishes an address has granted on each list, which is forgotten after a day. Genie's server doesn't keep a log of visits.</p>
 
       <h2>Emails</h2>
       <p>Genie only emails you codes (for signing up, logging in on a new device, changing your email and resetting your password), notices about your account (like your email being changed) and, if you stop using Genie, one warning before your account is deleted. No newsletters and no marketing. Emails are sent through Resend from its servers in the EU.</p>
@@ -118,7 +118,7 @@ export function Privacy() {
         <li><strong>Logins:</strong> 30 days after you last use them. <strong>Trusted devices:</strong> 30 days.</li>
         <li><strong>Email codes:</strong> they work for 10 minutes and are cleared out within a day.</li>
         <li><strong>Grants:</strong> until they're undone, the wish or list is deleted, or the owner reuses the list after the day.</li>
-        <li><strong>Spam counts:</strong> forgotten within about an hour.</li>
+        <li><strong>Spam counts:</strong> forgotten within about an hour (grants on each list: after a day).</li>
         <li><strong>Backups:</strong> the database is backed up every night and each backup is kept for 14 days, so anything deleted is gone from backups within 14 days.</li>
         <li><strong>Reports and complaints:</strong> the emails are kept for 6 months after they're dealt with (a year if the next point applies). A short log without names is kept.</li>
         <li><strong>Reports to the National Crime Agency:</strong> if content has to be reported, the law says a copy of it and the account details that go with it must be kept, securely, for a year.</li>

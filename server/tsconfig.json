@@ -9,5 +9,5 @@
     "allowImportingTsExtensions": true,
     "types": ["node"]
   },
-  "include": ["src", "scripts", "check.ts", "check-unfurl.ts", "../shared"]
+  "include": ["src", "scripts", "check.ts", "check-unfurl.ts", "check-auth.ts", "../shared"]
 }

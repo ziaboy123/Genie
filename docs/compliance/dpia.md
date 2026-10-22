@@ -13,7 +13,7 @@ Controller: Daniyal Zia, an individual in the UK (mail@daniyalzia.co.uk). Date: 
 | Logins (hashed token, user agent, dates), trusted devices (hashed token, "Chrome on Mac") | Owners | Security (legitimate interests) | 30 days |
 | Email codes (hashed), with name and password hash during sign-up | Owners | Security (legitimate interests) | 10 minutes, cleared within a day |
 | Grants (that a wish is granted, when, hash of the undo key) | Visitors, pseudonymous | Making grants work (legitimate interests) | Until undone, deleted or the list is reused. The undo key in the visitor's browser is cleared when they next open the list after its day |
-| IP addresses and emails in rate limits (memory only) | Everyone | Stopping abuse (legitimate interests) | About an hour |
+| IP addresses and emails in rate limits (memory only) | Everyone | Stopping abuse (legitimate interests) | About an hour (per-list grant counts: a day); forgotten on restart |
 | Nightly database backups | Everyone above | Recovery (legitimate interests) | 14 days |
 | Copies kept for a CSEA report to the NCA | The account reported | Legal obligation (OSA s.66 and its Regulations). Art 10 condition: DPA 2018 Sch 1 para 10(2), disclosure to the NCA | 1 year (report number 5 years) |
 | Emails to mail@ (reports, complaints, rights requests) | Reporters, complainants, owners reported on | Dealing with them (legitimate interests; legal obligation for complaints and rights requests) | 6 months after closing; a log without names |

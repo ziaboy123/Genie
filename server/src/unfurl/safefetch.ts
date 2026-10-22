@@ -1,6 +1,6 @@
 // Fetching shop pages without ever letting a pasted link reach inside the network.
 //
-// Anyone with an account can make the server fetch any link, and the server sits on the homelab LAN (10.68.x.x), so
+// Anyone with an account can make the server fetch any link, and the server sits on a private home network, so
 // every request is checked before it leaves: http(s) on the normal ports, no LAN-only names, and every address the
 // name resolves to must be public. The connection then goes to exactly the addresses that were checked, so a name
 // that answers differently a moment later (DNS rebinding) gets nowhere, and every redirect is checked from scratch.

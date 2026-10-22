@@ -74,7 +74,7 @@ Design:
 - Nothing to post but short text and links: no pictures, files, comments or messages. Visitors can't post at all.
 - Limits: 50 lists per account, 100 wishes per list, 120-character names. Invisible and text-direction characters are stripped from names.
 - Links must be http(s) (never `javascript:`); tracking parameters are removed; each wish shows its real domain.
-- Rate limits: sign-ups (10 an hour per IP, 3 per 10 minutes per email), adding wishes (60 per 15 minutes per account), grants (30 per 15 minutes per IP). Accounts need a confirmed email.
+- Rate limits: sign-ups (10 an hour per IP, 3 per 10 minutes per email), adding wishes (60 per 15 minutes per account), grants (30 per 15 minutes per IP, and 10 per list per day per visitor, so one person can't mark a whole list as granted; the owner can also clear all grants with a new link). Accounts need a confirmed email.
 - The link reader (GenieBot) refuses private and LAN addresses, re-checks every redirect and pins DNS answers. That protects the network rather than users, but means Genie can't be used to reach anything internal.
 
 Rules and processes:

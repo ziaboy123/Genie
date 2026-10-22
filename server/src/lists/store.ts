@@ -183,13 +183,18 @@ export async function deleteList(userId: string, rawId: unknown): Promise<void> 
   if (!(await q('delete from genie.lists where id = $1 and user_id = $2 returning id', [id, userId])).length) throw listGone();
 }
 
-/** A fresh share code: the old link stops working (it shows the not-found page). Grants stay. */
-export async function newLink(userId: string, rawId: unknown): Promise<OwnerList> {
+/** A fresh share code: the old link stops working (it shows the not-found page). Grants stay, unless the owner asks
+ *  to clear them all too (for a link that leaked and got its wishes marked as granted). Clearing every grant at once
+ *  tells the owner nothing about which wishes were granted. */
+export async function newLink(userId: string, rawId: unknown, clearGrants = false): Promise<OwnerList> {
   const id = checkId(rawId, listGone);
   for (let i = 0; ; i++) {
     try {
-      if (!(await q('update genie.lists set share_code = $3, updated_at = now() where id = $1 and user_id = $2 returning id', [id, userId, newShareCode()])).length)
-        throw listGone();
+      await tx(async c => {
+        if (!(await c.query('update genie.lists set share_code = $3, updated_at = now() where id = $1 and user_id = $2 returning id', [id, userId, newShareCode()])).rows.length)
+          throw listGone();
+        if (clearGrants) await c.query('delete from genie.grants g using genie.items i where g.item_id = i.id and i.list_id = $1', [id]);
+      });
       break;
     } catch (e: any) {
       if (e?.code !== '23505' || i >= 4) throw e;   // unique violation: another list has that code, so roll again
@@ -344,22 +349,56 @@ export async function viewList(code: unknown, tokens: unknown, viewerId: string 
   return { title: list.title, ownerName: list.owner_name, eventDate: list.event_date, revealed, isOwner, items };
 }
 
-/** Grant a wish: returns the undo token, which only this browser ever holds (the database keeps its hash). */
-export async function grantWish(code: unknown, rawItemId: unknown, viewerId: string | null): Promise<string> {
+// ---------- grants per visitor per list ----------
+// a share link that ends up somewhere it shouldn't mustn't let one visitor mark the whole list as granted, so each
+// visitor (IP address, IPv6 per /64) gets a few grants per list per day: plenty for someone buying several presents.
+// Kept here rather than in ratelimit.ts, which forgets a key after an hour. Undoing a grant doesn't give it back.
+const GRANTS_PER_LIST = 10, GRANT_DAY = 24 * 3600_000;
+const grantsBy = new Map<string, number[]>();
+/** Takes one of this visitor's grants on this list; false when they've used them all today. */
+function takeGrant(key: string): boolean {
+  const now = Date.now();
+  const recent = (grantsBy.get(key) ?? []).filter(t => now - t < GRANT_DAY);
+  if (recent.length >= GRANTS_PER_LIST) { grantsBy.set(key, recent); return false; }
+  recent.push(now);
+  grantsBy.set(key, recent);
+  return true;
+}
+/** Hands back a grant that didn't happen (someone else got there first, or the wish was deleted). */
+function giveBackGrant(key: string) {
+  const recent = grantsBy.get(key);
+  recent?.pop();
+  if (recent && !recent.length) grantsBy.delete(key);
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, list] of grantsBy) if (!list.some(t => now - t < GRANT_DAY)) grantsBy.delete(k);
+}, 3600_000).unref();
+
+/** Grant a wish: returns the undo token, which only this browser ever holds (the database keeps its hash).
+ *  `visitor` is who's asking as far as limits go (their IP address); it's never stored. */
+export async function grantWish(code: unknown, rawItemId: unknown, viewerId: string | null, visitor: string): Promise<string> {
   const list = await byCode(code);
   if (!list) throw shareGone();
   if (viewerId === list.user_id) throw new Problem('This is your list.', 403);
   // once the day has passed the owner can see grants, so a new one would be no secret
   if (isRevealed(list.event_date)) throw new Problem("This list's day has been and gone.", 403);
   const itemId = checkId(rawItemId, wishGone);
+  const key = `${visitor}:${list.id}`;
+  if (!takeGrant(key)) throw new Problem("You've granted a lot of wishes on this list today. Try again tomorrow.", 429);
   const token = randomBytes(32).toString('base64url');
-  // one grant per wish: if two people press at once, the first insert wins and the other one inserts nothing
-  const won = await q(`insert into genie.grants (item_id, undo_hash) select id, $3::text from genie.items where id = $1 and list_id = $2
-    on conflict do nothing returning item_id`, [itemId, list.id, sha256(token)])
-    .catch(e => { if (e?.code === '23503') throw wishGone(); throw e; });   // the wish was deleted mid-grant
-  if (won.length) return token;
-  if (await one('select 1 from genie.items where id = $1 and list_id = $2', [itemId, list.id])) throw new Problem('Someone just granted this one.', 409);
-  throw wishGone();
+  try {
+    // one grant per wish: if two people press at once, the first insert wins and the other one inserts nothing
+    const won = await q(`insert into genie.grants (item_id, undo_hash) select id, $3::text from genie.items where id = $1 and list_id = $2
+      on conflict do nothing returning item_id`, [itemId, list.id, sha256(token)])
+      .catch(e => { if (e?.code === '23503') throw wishGone(); throw e; });   // the wish was deleted mid-grant
+    if (won.length) return token;
+    if (await one('select 1 from genie.items where id = $1 and list_id = $2', [itemId, list.id])) throw new Problem('Someone just granted this one.', 409);
+    throw wishGone();
+  } catch (e) {
+    giveBackGrant(key);   // only grants that happen count
+    throw e;
+  }
 }
 
 /** Undo a grant: only with the token the grant handed out. */

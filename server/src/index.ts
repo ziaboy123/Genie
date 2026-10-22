@@ -30,8 +30,9 @@ async function sendIndex(res: ServerResponse, rel: string) {
     const meta = SHARE_CODE.test(code) && DB_ENABLED ? await shareMeta(code).catch(() => null) : null;
     if (meta) {
       const title = escapeHtml(`${meta.title}`), desc = escapeHtml(`${meta.ownerName}'s wishlist on Genie · ${meta.count} ${meta.count === 1 ? 'wish' : 'wishes'}`);
-      html = html.replace(/<title>[^<]*<\/title>/, `<title>${title} · Genie</title>`)
-        .replace('</head>', `<meta property="og:title" content="${title}"><meta property="og:description" content="${desc}"><meta property="og:type" content="website"><meta name="robots" content="noindex, nofollow"></head>`);
+      // replacer functions: a replacement string would expand $& $` $$ in the owner's title or name ("Gifts under $`10" copied the head in)
+      html = html.replace(/<title>[^<]*<\/title>/, () => `<title>${title} · Genie</title>`)
+        .replace('</head>', () => `<meta property="og:title" content="${title}"><meta property="og:description" content="${desc}"><meta property="og:type" content="website"><meta name="robots" content="noindex, nofollow"></head>`);
     }
   }
   res.writeHead(200, { 'content-type': TYPES['.html'], 'cache-control': 'no-cache' });

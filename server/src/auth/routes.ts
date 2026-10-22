@@ -12,6 +12,14 @@ import { AUTH_READY, sha256 } from './security.ts';
 
 const SESSION = A.SESSION_COOKIE, DEVICE = A.DEVICE_COOKIE, MONTH = 30 * 86400;
 
+// Per-email limits count each visitor separately, with a much higher shared limit behind them: one shared count let
+// anyone who knew an email use it up and keep the owner from logging in or resetting their password.
+/** Too many code guesses for this email? Every code also has its own five tries; this stops a crowd of visitors (or one
+ * with a lot of IPv6 addresses) adding up to many guesses across new codes. */
+// counted per email AND visitor (with a high shared backstop), so a stranger burning guesses can't block the owner's own code
+const codeGuesses = (ip: string, email: string) =>
+  limited(`code:${ip}`, 30, 900_000) || limited(`codeverify:${email}:${ip}`, 10, 900_000) || limited(`codeverify:${email}`, 100, 900_000);
+
 /** Handles <base>/api/me, /api/auth/*, /api/account/* (and /api/dev/mail on the development server). Returns false if not one of these. */
 export async function accountRoutes(req: IncomingMessage, res: ServerResponse, rel: string): Promise<boolean> {
   if (!(rel === '/api/me' || rel.startsWith('/api/auth/') || rel.startsWith('/api/account/') || (DEV && rel === '/api/dev/mail'))) return false;
@@ -54,24 +62,26 @@ export async function accountRoutes(req: IncomingMessage, res: ServerResponse, r
         return true;
       }
       case '/api/auth/signup/verify':
-        if (limited(`code:${ip}`, 30, 900_000)) throw tooMany();
+        if (codeGuesses(ip, email)) throw tooMany();
         return await login(await A.signupVerify(email, body.code), true);
       case '/api/auth/login': {
-        if (limited(`login:${ip}`, 30, 900_000) || limited(`login:${email}`, 8, 900_000)) throw tooMany();
+        if (limited(`login:${ip}`, 30, 900_000)) throw tooMany();
+        // a browser this account already trusts is almost certainly the owner's, so strangers' tries don't hold it up
+        if (!(await A.trustedFor(email, jar[DEVICE])) && (limited(`login:${email}:${ip}`, 8, 900_000) || limited(`login:${email}`, 100, 900_000))) throw tooMany();
         const result = await A.loginStart(email, body.password, jar[DEVICE]);
         if ('needCode' in result) { send(res, 200, { ok: true, needCode: true }); return true; }
         return await login(result.userId, false);
       }
       case '/api/auth/login/verify':
-        if (limited(`code:${ip}`, 30, 900_000)) throw tooMany();
+        if (codeGuesses(ip, email)) throw tooMany();
         return await login(await A.loginVerify(email, body.code), body.trust === true);
       case '/api/auth/forgot':
-        if (limited(`forgot:${ip}`, 10, 3600_000) || limited(`forgot:${email}`, 3, 600_000)) throw tooMany();
+        if (limited(`forgot:${ip}`, 10, 3600_000) || limited(`forgot:${email}:${ip}`, 3, 600_000) || limited(`forgot:${email}`, 30, 3600_000)) throw tooMany();
         await A.forgotStart(email);
         send(res, 200, { ok: true });
         return true;
       case '/api/auth/forgot/verify':
-        if (limited(`code:${ip}`, 30, 900_000)) throw tooMany();
+        if (codeGuesses(ip, email)) throw tooMany();
         return await login(await A.forgotVerify(email, body.code, body.password), false);
       case '/api/auth/logout':
         // the trusted-device cookie stays, so logging back in here doesn't need a code
@@ -100,7 +110,9 @@ export async function accountRoutes(req: IncomingMessage, res: ServerResponse, r
         return await login(me.id, trusted);
       }
       case '/api/account/email': await A.changeEmailStart(me.id, body.email, body.password, me.email); break;
-      case '/api/account/email/verify': await A.changeEmailVerify(me.id, body.email, body.code, me.email); break;
+      case '/api/account/email/verify':
+        if (codeGuesses(ip, email)) throw tooMany();
+        await A.changeEmailVerify(me.id, body.email, body.code, me.email); break;
       case '/api/account/devices': {
         const mine = jar[DEVICE] ? sha256(jar[DEVICE]).slice(0, 12) : '';
         send(res, 200, { devices: (await A.listDevices(me.id)).map(d => ({ ...d, current: d.id === mine })) });

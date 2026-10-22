@@ -230,8 +230,17 @@ const asList = (v: unknown): unknown[] => Array.isArray(v) ? v : v === undefined
 const PRODUCT_TYPES = new Set(['product', 'productgroup', 'productmodel', 'individualproduct', 'someproducts', 'vehicle', 'car']);
 const typesOf = (o: Json) => asList(o['@type']).filter((t): t is string => typeof t === 'string').map(t => t.replace(/^https?:\/\/schema\.org\//i, '').toLowerCase());
 
+// no real product block is anywhere near this big; a bigger one is skipped rather than parsed
+const MAX_JSON = 512 * 1024;
 function parseJson(text: string): unknown {
-  const body = text.trim().replace(/^<!--|-->$/g, '').replace(/^\s*(\/\/)?\s*<!\[CDATA\[|(\/\/)?\s*\]\]>\s*$/g, '');
+  if (text.length > MAX_JSON) return null;
+  // unwrap <!-- --> and //<![CDATA[ ... //]]> with string methods: an unanchored regex here backtracked
+  // quadratically over long runs of spaces, and one crafted page froze the whole server for minutes
+  let body = text.trim();
+  if (body.startsWith('<!--')) body = body.slice(4);
+  if (body.endsWith('-->')) body = body.slice(0, -3);
+  body = body.trim().replace(/^(?:\/\/)?\s*<!\[CDATA\[/, '');
+  if (body.endsWith(']]>')) { body = body.slice(0, -3).trimEnd(); if (body.endsWith('//')) body = body.slice(0, -2); }
   try { return JSON.parse(body); }
   catch {
     // raw line breaks and tabs inside strings are a common slip; as JSON whitespace they're harmless to replace

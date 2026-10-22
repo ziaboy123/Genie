@@ -116,8 +116,8 @@ await fails(() => cleanUrl(`https://shop.com/${'a'.repeat(2000)}`), isProblem('T
 console.log('cleanUrl OK');
 
 // ---------- addresses and names ----------
-for (const a of ['127.0.0.1', '10.68.5.135', '10.0.0.1', '172.16.0.1', '172.31.255.255', '192.168.1.1', '169.254.169.254', '100.64.0.1',
-  '0.0.0.0', '192.0.2.1', '198.18.0.1', '224.0.0.1', '255.255.255.255', '::', '::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '::ffff:10.68.5.135',
+for (const a of ['127.0.0.1', '10.20.30.40', '10.0.0.1', '172.16.0.1', '172.31.255.255', '192.168.1.1', '169.254.169.254', '100.64.0.1',
+  '0.0.0.0', '192.0.2.1', '198.18.0.1', '224.0.0.1', '255.255.255.255', '::', '::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '::ffff:10.20.30.40',
   '64:ff9b::a44:587', '2002:a44:587::1', '::a44:587', 'fe80::1', 'fe80::1%eth0', 'fc00::1', 'fd12:3456::1', 'fec0::1', 'ff02::1',
   '2001:db8::1', '100::1', 'not an address'])
   assert.ok(isBlockedAddress(a), `${a} should be blocked`);
@@ -125,7 +125,7 @@ for (const a of ['8.8.8.8', '1.1.1.1', '93.184.215.14', '172.32.0.1', '100.128.0
   assert.ok(!isBlockedAddress(a), `${a} should be allowed`);
 // [link, why it's refused]; the spellings of 127.0.0.1 are normalised by the URL parser before the check
 const refused: [string, string][] = [
-  ['http://127.0.0.1/', 'address'], ['http://localhost/', 'name'], ['http://10.68.5.135/', 'address'], ['http://169.254.169.254/latest/meta-data/', 'address'],
+  ['http://127.0.0.1/', 'address'], ['http://localhost/', 'name'], ['http://10.20.30.40/', 'address'], ['http://169.254.169.254/latest/meta-data/', 'address'],
   ['http://[::1]/', 'address'], ['http://[::ffff:127.0.0.1]/', 'address'], ['http://2130706433/', 'address'], ['http://0x7f000001/', 'address'],
   ['http://192.168.1.1/', 'address'], ['http://metadata.google.internal/', 'name'], ['http://0x7f.1/', 'address'], ['http://0177.0.0.1/', 'address'],
   ['http://127.1/', 'address'], ['http://0/', 'address'], ['http://[fe80::1]/', 'address'], ['http://[fd00::1]/', 'address'],
@@ -141,7 +141,7 @@ for (const link of ['http://8.8.8.8/', 'https://8.8.8.8:443/', 'http://8.8.8.8:8
   assert.equal((await vetUrl(new URL(link), soon())).addresses.length, 1, link);
 // public names that resolve to LAN addresses, through real DNS (skipped when DNS doesn't answer for them: some
 // home routers drop such answers as a rebinding guard)
-const answered = await Promise.all(['localtest.me', '10.68.5.135.nip.io'].map(async name => {
+const answered = await Promise.all(['localtest.me', '10.20.30.40.nip.io'].map(async name => {
   try { await vetUrl(new URL(`http://${name}/`), soon()); }
   catch (e: any) {
     if (e instanceof FetchFailed) return false;
@@ -171,11 +171,11 @@ assert.equal(seen['accept-language'], 'en-GB,en;q=0.8');
 assert.equal(seen.cookie, undefined);
 // every redirect is checked again from scratch
 const before = hits.length;
-for (const to of ['http://127.0.0.1/', 'http://169.254.169.254/latest/meta-data/', `http://localhost:${port}/page`, 'http://[::ffff:10.68.5.135]/',
-  'http://10.68.5.135/', 'http://router.lan/', 'ftp://shop.com/', 'http://shop.com:8080/'])
+for (const to of ['http://127.0.0.1/', 'http://169.254.169.254/latest/meta-data/', `http://localhost:${port}/page`, 'http://[::ffff:10.20.30.40]/',
+  'http://10.20.30.40/', 'http://router.lan/', 'ftp://shop.com/', 'http://shop.com:8080/'])
   await fails(safeFetch(`${base}/redirect?to=${encodeURIComponent(to)}`, PAGE, testVet), isBlocked(), `redirect to ${to}`);
 assert.deepEqual(hits.slice(before).map(h => h.path), Array(8).fill('/redirect'), 'only the redirects themselves were fetched');
-await fails(unfurl(`${base}/redirect?to=${encodeURIComponent('http://10.68.5.135/')}`, testVet), isProblem(BLOCKED), 'unfurl of a redirect into the LAN');
+await fails(unfurl(`${base}/redirect?to=${encodeURIComponent('http://10.20.30.40/')}`, testVet), isProblem(BLOCKED), 'unfurl of a redirect into the LAN');
 assert.match((await safeFetch(`${base}/hops/3`, PAGE, testVet)).body.toString(), /Arrived/, '3 redirects are fine');
 await fails(safeFetch(`${base}/hops/4`, PAGE, testVet), isFailed, '4 redirects are too many');
 assert.equal((await safeFetch(`${base}/redirect?to=/page`, PAGE, testVet)).url, `${base}/page`, 'relative redirect');
@@ -285,6 +285,11 @@ facts = readPage(`<!-- <title>Commented Out</title> --><script>var t = "<title>I
   <meta content="a > b" property="og:description"><title>Real Title</title>`, at);
 assert.equal(facts.title, 'Real Title');
 assert.equal(readPage(`<title>${'Long words go here '.repeat(20)}</title>`, at).title!.length <= 120, true);
+// JSON-LD wrapped in old-style comment or CDATA markers still reads
+for (const wrapped of ['{"@type":"Product","name":"Wrapped Mug"}', '<!-- {"@type":"Product","name":"Wrapped Mug"} -->',
+  '<![CDATA[{"@type":"Product","name":"Wrapped Mug"}]]>', '//<![CDATA[\n{"@type":"Product","name":"Wrapped Mug"}\n//]]>',
+  '<!--//<![CDATA[\n{"@type":"Product","name":"Wrapped Mug"}\n//]]>-->'])
+  assert.equal(readPage(`<script type="application/ld+json">${wrapped}</script>`, at).title, 'Wrapped Mug', wrapped);
 // crafted pages that make tree-building parsers crawl are read in linear time
 for (const [what, html] of [
   ['nested divs', `${'<div>'.repeat(200_000)}<meta property="og:title" content="Deep Socks">`],
@@ -294,6 +299,10 @@ for (const [what, html] of [
   ['many attributes', `<meta ${'a=b '.repeat(300_000)}>`],
   ['many tags', '<meta property="x" content="y">'.repeat(50_000)],
   ['unclosed script', `<script type="application/ld+json">${'['.repeat(500_000)}`],
+  // the old CDATA unwrap regex took minutes on long runs of spaces
+  ['spaces in JSON-LD', `<script type="application/ld+json">{${' '.repeat(2 * MB)}}</script>`],
+  ['spaces in a small JSON-LD', `<script type="application/ld+json">{"name":"x${' '.repeat(400_000)}"}</script>`],
+  ['comment marks in JSON-LD', `<script type="application/ld+json">{${'// '.repeat(150_000)}}</script>`],
 ] as const) {
   const t = performance.now();
   const r = readPage(html, at);

@@ -147,7 +147,7 @@ Clean-up (`server/src/auth/inactive.ts`, daily): an account unused for 23 months
 
 ## 6. Security (Cipher-level, because it takes links from strangers)
 
-- **Link fetching is the big risk.** The server fetches any URL someone pastes, so it must refuse anything pointing inside the network. A stranger could otherwise use Genie to poke at the homelab (10.68.x, Proxmox, the router).
+- **Link fetching is the big risk.** The server fetches any URL someone pastes, so it must refuse anything pointing inside the network. A stranger could otherwise use Genie to poke at the private network behind it (other servers, the router).
   - Block private, loopback, link-local and IPv6-local addresses.
   - Re-check after every redirect (max 3).
   - Pin the resolved IP, which stops DNS rebinding.
@@ -191,6 +191,11 @@ Clean-up (`server/src/auth/inactive.ts`, daily): an account unused for 23 months
 - **At launch (phase 4):** add Genie to daniyalzia.co.uk/privacy (and its Resend sentence, noting that Genie is the exception to its server-logs sentence) and /terms; add a LICENSE before the repo goes public; a quick UK IPO search for "Genie" in classes 35 and 42.
 
 ---
+
+- **Shared origin (accepted, 2026-10-22):** Genie lives at daniyalzia.co.uk/genie, the same browser origin as Gambit, DeckForge, WatchMatch, Millennium Arena, the portfolio and Umami's script. Path=/genie cookies, SameSite and the Origin check don't separate apps on one origin. So a script-injection (XSS) bug in ANY of those apps could act as a logged-in Genie owner (read lists, delete, relink) or plant a session cookie. Daniyal chose to keep /genie for consistency, since Arena and DeckForge carry the same exposure. Consequences:
+  - treat any XSS found in a sibling app as also affecting Genie accounts;
+  - keep every app's CSP strict;
+  - proper isolation would be a whole-site move to subdomains, not Genie alone.
 
 ## 7. Build order
 

@@ -19,11 +19,15 @@ server.stderr.on('data', d => { serverLog += d; });
 const stop = () => { try { server.kill(); } catch {} };
 process.on('exit', stop);
 
-/** A browser: keeps its own cookies. */
+/** A browser: keeps its own cookies. `ip` makes it look like a visitor at that address (the server trusts
+ *  CF-Connecting-IP from loopback, as it does from Cloudflare's tunnel). */
 class Browser {
   jar = new Map<string, string>();
+  ip?: string;
+  constructor(ip?: string) { this.ip = ip; }
   async call(path: string, body?: unknown, opts: { origin?: string | null; type?: string; raw?: string } = {}) {
     const headers: Record<string, string> = {};
+    if (this.ip) headers['cf-connecting-ip'] = this.ip;
     if (this.jar.size) headers.cookie = [...this.jar].map(([k, v]) => `${k}=${v}`).join('; ');
     const post = body !== undefined || opts.raw !== undefined;
     if (post) {
@@ -135,12 +139,14 @@ async function main() {
   const stranger = await newAccount('Stranger');
   assert.equal((await stranger.call('lists/get', { id: list.id })).status, 404, "someone else's list is a 404");
   assert.ok((await owner.call('items/add', { listId: list.id, url: 'http://127.0.0.1:3018/genie/api/health' })).status >= 400, 'local addresses are refused');
-  assert.ok((await owner.call('items/add', { listId: list.id, url: 'http://10.68.5.135/' })).status >= 400, 'the homelab is refused');
+  assert.ok((await owner.call('items/add', { listId: list.id, url: 'http://10.20.30.40/' })).status >= 400, 'the homelab is refused');
   assert.ok((await owner.call('items/add', { listId: list.id, url: 'javascript:alert(1)' })).status >= 400);
   let online = true;
   let item: any;
   try {
     item = (await owner.ok('items/add', { listId: list.id, url: 'https://example.com/?utm_source=check' })).item;
+    // the fetcher never throws for a site problem: a failed fetch comes back with the name guessed from the link
+    if (item.title !== 'Example Domain' && /example\.com/i.test(item.title)) throw new Error('fetch failed (network)');
     assert.equal(item.title, 'Example Domain');
     assert.equal(item.url, 'https://example.com/');
   } catch (e: any) {
@@ -190,11 +196,44 @@ async function main() {
   assert.equal((await anon.call('w/view', { code: 'AAAAAAAA', tokens: [] })).status, 404);
   section('Share page and grants');
 
-  // ----- a new link kills the old one -----
+  // ----- a new link kills the old one; grants stay unless the owner clears them too -----
+  const { token: kept } = await visitor.ok('w/grant', { code, itemId: second.id });
   const relinked = (await owner.ok('lists/new-link', { id: list.id })).list;
   assert.notEqual(relinked.shareCode, code);
   assert.equal((await anon.call('w/view', { code, tokens: [] })).status, 404);
+  const stateOn = async (c: string) => (await other.ok('w/view', { code: c, tokens: [] })).list.items.find((i: any) => i.id === second.id).state;
+  assert.equal(await stateOn(relinked.shareCode), 'granted', 'a plain new link keeps grants');
+  assert.equal((await stranger.call('lists/new-link', { id: list.id, clearGrants: true })).status, 404, "nobody else can relink or clear a list");
+  assert.equal(await stateOn(relinked.shareCode), 'granted', "a stranger's try clears nothing");
+  const cleared = (await owner.ok('lists/new-link', { id: list.id, clearGrants: true })).list;
+  assert.notEqual(cleared.shareCode, relinked.shareCode);
+  assert.equal(cleared.grantedCount, null, 'clearing still says nothing about grants before the day');
+  assert.ok((await other.ok('w/view', { code: cleared.shareCode, tokens: [] })).list.items.every((i: any) => i.state === 'open'), 'every wish is open again');
+  assert.equal((await visitor.call('w/ungrant', { code: cleared.shareCode, itemId: second.id, token: kept })).status, 404, 'a cleared grant has nothing to undo');
   section('New link');
+
+  // ----- one visitor can grant only so many wishes on one list a day (a leaked link can't mark the whole list) -----
+  const capList = (await owner.ok('lists/create', { title: 'Lots of wishes', eventDate: isoDay(20) })).list;
+  const capIds: string[] = [];
+  for (let i = 0; i < 12; i++)
+    capIds.push((await owner.ok('items/add', { listId: capList.id, url: `https://no-such-shop-genie-check.co.uk/products/cap-wish-${i}` })).item.id);
+  const greedy = new Browser('203.0.113.7'), next = new Browser('203.0.113.8'), late = new Browser('2001:db8:1:2::9');
+  const greedyTokens: string[] = [];
+  for (const id of capIds.slice(0, 10)) greedyTokens.push((await greedy.ok('w/grant', { code: capList.shareCode, itemId: id })).token);
+  const capped = await greedy.call('w/grant', { code: capList.shareCode, itemId: capIds[10] });
+  assert.equal(capped.status, 429, 'the 11th grant on one list in a day is refused');
+  assert.match(capped.json.error, /Try again tomorrow/);
+  // undoing has its own count, and doesn't hand a grant back
+  await greedy.ok('w/ungrant', { code: capList.shareCode, itemId: capIds[0], token: greedyTokens[0] });
+  assert.equal((await greedy.call('w/grant', { code: capList.shareCode, itemId: capIds[0] })).status, 429, 'undo then grant again is still capped');
+  // the cap is per list: the same visitor can still grant on another list
+  await greedy.ok('w/grant', { code: cleared.shareCode, itemId: second.id });
+  // and per visitor: someone else can grant here
+  await next.ok('w/grant', { code: capList.shareCode, itemId: capIds[10] });
+  // a grant someone else got to first doesn't count
+  for (let i = 0; i < 10; i++) assert.equal((await late.call('w/grant', { code: capList.shareCode, itemId: capIds[1] })).status, 409);
+  await late.ok('w/grant', { code: capList.shareCode, itemId: capIds[11] });
+  section('Grant cap');
 
   // ----- the reveal (a list whose day was yesterday) -----
   const past = (await owner.ok('lists/create', { title: 'Yesterday', eventDate: isoDay(-1) })).list;
@@ -206,11 +245,22 @@ async function main() {
   section('Reveal');
 
   // ----- link previews: the share page says whose list it is, safely -----
-  const page = await fetch(`${BASE}/w/${relinked.shareCode}`);
+  const page = await fetch(`${BASE}/w/${cleared.shareCode}`);
   if (page.status === 200 && /<html/i.test(await page.clone().text())) {
     const html = await page.text();
     assert.match(html, /og:title/);
     assert.equal(page.headers.get('x-robots-tag'), 'noindex, nofollow');
+    // $ patterns in a title are just text (a replacement string once pasted the page's own head into it)
+    for (const t of ["a $' b", 'a $` b', 'a $& b $$ c']) {
+      const l = (await owner.ok('lists/create', { title: t, eventDate: isoDay(5) })).list;
+      assert.equal(l.title, t);
+      const h = await (await fetch(`${BASE}/w/${l.shareCode}`)).text();
+      const esc = t.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+      assert.equal(h.match(/<title>/g)?.length, 1, `one <title> for ${t}`);
+      assert.ok(h.includes(`<title>${esc} · Genie</title>`), `<title> for ${t}`);
+      assert.ok(h.includes(`<meta property="og:title" content="${esc}">`), `og:title for ${t}`);
+      assert.equal(h.match(/<head>/g)?.length, 1, `one <head> for ${t}`);
+    }
     section('Link previews');
   } else console.log('(client not built: skipped link previews)');
 
@@ -262,7 +312,7 @@ async function main() {
 
   // ----- deleting an account takes its lists with it -----
   await owner.ok('account/delete', { password: owner.password });
-  assert.equal((await anon.call('w/view', { code: relinked.shareCode, tokens: [] })).status, 404);
+  assert.equal((await anon.call('w/view', { code: cleared.shareCode, tokens: [] })).status, 404);
   created.splice(created.indexOf(owner), 1);
   section('Account deletion');
 

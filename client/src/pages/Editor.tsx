@@ -282,13 +282,17 @@ function useAction() {
 
 function NewLinkSheet({ open, list, onClose, onDone }: { open: boolean; list: OwnerList; onClose: () => void; onDone: (l: OwnerList) => void }) {
   const a = useAction();
-  const close = () => { a.reset(); onClose(); };
+  const [clearGrants, setClearGrants] = useState(false);
+  const close = () => { a.reset(); setClearGrants(false); onClose(); };
   return (
     <Sheet open={open} onClose={close} title="Get a new link?">
-      <p className="lede">The old link will stop working. Anyone you've sent it to will need the new one. Your wishes and grants stay as they are.</p>
+      <p className="lede">The old link will stop working. Anyone you've sent it to will need the new one. Your wishes stay as they are, and so do grants unless you clear them.</p>
+      {/* for a link that got out and had wishes marked as granted; clearing them all gives nothing away about which */}
+      <label className="check"><input type="checkbox" checked={clearGrants} onChange={e => setClearGrants(e.target.checked)} />
+        <span>Also clear all grants, in case someone marked wishes they aren't buying. Anyone who really granted one will need to grant it again.</span></label>
       <ErrorText>{a.err}</ErrorText>
-      <button type="button" className="btn" disabled={a.busy} onClick={() => a.run(async () => onDone((await api<{ list: OwnerList }>('lists/new-link', { id: list.id })).list))}>
-        {a.busy ? 'Making a new link…' : 'Get a new link'}</button>
+      <button type="button" className="btn" disabled={a.busy} onClick={() => a.run(async () => { onDone((await api<{ list: OwnerList }>('lists/new-link', { id: list.id, clearGrants })).list); setClearGrants(false); })}>
+        {a.busy ? 'Making a new link…' : clearGrants ? 'Get a new link and clear grants' : 'Get a new link'}</button>
       <button type="button" className="btn text" onClick={close}>Cancel</button>
     </Sheet>
   );

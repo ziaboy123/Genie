@@ -6,7 +6,8 @@
 //   - passwords: bcrypt (cost 12); 10+ characters; common ones refused
 //   - a wrong email takes as long to reject as a wrong password, and sign-up / password reset answer the same way
 //     whether or not an account exists (no finding out who has an account)
-//   - email codes: six digits, 10 minutes, one use, five tries, stored only as a keyed hash
+//   - email codes: six digits, 10 minutes, one use, five tries (counted before the guess is compared, so parallel
+//     guesses can't skip the count), stored only as a keyed hash; a missing code and a wrong one get the same answer
 //   - sessions and devices: random tokens in cookies, stored only as SHA-256; a password change or reset bumps the
 //     account's session version, which ends every login at once
 import bcrypt from 'bcryptjs';
@@ -65,19 +66,25 @@ async function sendCode(email: string, purpose: Purpose, what: string, payload: 
   await sendMail(email, mail.subject, mail.text);
 }
 
-/** Use up a code, returning what was saved with it. Wrong guesses count; the fifth one burns the code. */
+// One answer for a missing, wrong, expired or used-up code: a different one for "no code" would tell anyone poking at
+// the verify step whether an email has an account (forgot only makes a code when it does, sign-up only when it doesn't).
+const BAD_CODE = "That code isn't right or has expired. Ask for a new one.";
+const NO_HASH = '0'.repeat(64);
+
+/** Use up a code, returning what was saved with it. Five tries per code, wrong guesses included. */
 async function useCode(email: string, purpose: Purpose, code: unknown): Promise<Record<string, any>> {
-  const row = await one('select id, code_hash, attempts from genie.codes where email = $1 and purpose = $2 and expires_at > now() order by id desc limit 1', [email, purpose]);
-  if (!row) throw new Problem('That code has expired. Ask for a new one.');
   const typed = String(code ?? '').replace(/\D/g, '');
-  if (typed.length !== 6 || !sameHash(row.code_hash, codeHash(purpose, email, typed))) {
-    const tries = (await one('update genie.codes set attempts = attempts + 1 where id = $1 returning attempts', [row.id]))?.attempts ?? 5;
-    if (tries >= 5) { await q('delete from genie.codes where id = $1', [row.id]); throw new Problem('Too many wrong codes. Ask for a new one.'); }
-    throw new Problem("That code isn't right.");
-  }
+  // a try is claimed before the guess is compared, in one statement: guesses sent all at once queue on the row, and
+  // only the first five get a code_hash back (checking first and counting after let every parallel guess in)
+  const row = await one(`update genie.codes set attempts = attempts + 1
+    where id = (select id from genie.codes where email = $1 and purpose = $2 order by id desc limit 1) and attempts < 5 and expires_at > now()
+    returning id, code_hash`, [email, purpose]);
+  // the same hashing and comparing whether or not there was a code, so the time taken doesn't give it away either
+  const right = sameHash(row?.code_hash ?? NO_HASH, codeHash(purpose, email, typed)) && typed.length === 6;
+  if (!row || !right) throw new Problem(BAD_CODE);
   // deleting it is what claims it: if two requests race with the right code, only one gets the row back
   const claimed = await one('delete from genie.codes where id = $1 returning payload', [row.id]);
-  if (!claimed) throw new Problem('That code has already been used.');
+  if (!claimed) throw new Problem(BAD_CODE);
   return claimed.payload;
 }
 
@@ -199,6 +206,11 @@ export async function trustDevice(userId: string, label: string): Promise<string
   return token;
 }
 
+/** Does this browser hold a trusted-device cookie for the account with this email? (Lets the owner past the per-email login limit.) */
+export const trustedFor = async (email: string, deviceToken: string | undefined) =>
+  !!email && !!deviceToken && deviceToken.length <= 100 && !!(await one(`select 1 from genie.devices d join genie.users u on u.id = d.user_id
+    where d.token_hash = $1 and u.email = $2 and d.expires_at > now()`, [sha256(deviceToken), email]));
+
 export const isTrusted = async (userId: string, deviceToken: string | undefined) =>
   !!deviceToken && deviceToken.length <= 100 && !!(await one('select 1 from genie.devices where token_hash = $1 and user_id = $2 and expires_at > now()', [sha256(deviceToken), userId]));
 
@@ -245,6 +257,8 @@ export async function changeEmailStart(userId: string, newEmailIn: unknown, pass
   const email = normEmail(newEmailIn);
   checkEmail(email);
   if (email === oldEmail) throw new Problem("That's already your email.");
+  // an accepted exception to "never say who has an account": only someone logged in who knows their own password gets
+  // this far, it's held to 30 tries per 15 minutes per account, and sending a code anyway would mail a stranger for nothing
   if (await one('select 1 from genie.users where email = $1', [email])) throw new Problem('That email already has an account.');
   await sendCode(email, 'email', 'confirm your new email address', { userId });
 }

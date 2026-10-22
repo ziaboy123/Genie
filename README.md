@@ -9,3 +9,7 @@ Wishlist site at daniyalzia.co.uk/genie: make a list of things you want (with li
 - `PLAN.md`: the plan, decisions and launch gates
 
 Checks: `npm run typecheck`, `npm run build`, `cd server && npx tsx check-unfurl.ts` (no database needed) and `npm run check` (needs the `genie_dev` database).
+
+## Licence
+
+MIT, see [LICENSE](LICENSE).

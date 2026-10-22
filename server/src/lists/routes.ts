@@ -15,14 +15,15 @@ const WINDOW = 15 * 60_000;
 /** The share page: anyone with the link, logged in or not (a logged-in owner just sees no grants). */
 async function shareApi(req: IncomingMessage, action: string): Promise<unknown> {
   const ip = clientIp(req);
-  // opening the page is cheap and happens a lot; granting is what someone could spam
-  if (action === 'view' ? limited(`view:${ip}`, 300, WINDOW) : limited(`grant:${ip}`, 30, WINDOW)) throw tooMany();
+  // opening the page is cheap and happens a lot; granting is what someone could spam. Undo has its own count, so
+  // undoing never uses up granting (store.ts also caps grants per visitor on each list)
+  if (limited(`${action}:${ip}`, action === 'view' ? 300 : 30, WINDOW)) throw tooMany();
   const body = await readJson(req);
   const token = cookies(req)[SESSION];
   const viewerId = async () => (token ? (await sessionUser(token))?.id ?? null : null);
   switch (action) {
     case 'view': return { list: await S.viewList(body.code, body.tokens, await viewerId()) };
-    case 'grant': return { token: await S.grantWish(body.code, body.itemId, await viewerId()) };
+    case 'grant': return { token: await S.grantWish(body.code, body.itemId, await viewerId(), ip) };
     case 'ungrant': await S.ungrantWish(body.code, body.itemId, body.token); return { ok: true };
     default: throw notFound();
   }
@@ -58,7 +59,7 @@ export async function listRoutes(req: IncomingMessage, res: ServerResponse, rel:
       case '/api/lists/get': out = { list: await S.getList(me.id, body.id) }; break;
       case '/api/lists/update': out = { list: await S.updateList(me.id, body) }; break;
       case '/api/lists/delete': await S.deleteList(me.id, body.id); out = { ok: true }; break;
-      case '/api/lists/new-link': out = { list: await S.newLink(me.id, body.id) }; break;
+      case '/api/lists/new-link': out = { list: await S.newLink(me.id, body.id, body.clearGrants === true) }; break;
       case '/api/lists/reuse': out = { list: await S.reuseList(me.id, body) }; break;
       case '/api/items/add': out = { item: await S.addItem(me.id, body) }; break;
       case '/api/items/update': out = { item: await S.updateItem(me.id, body) }; break;
