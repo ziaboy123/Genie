@@ -68,15 +68,38 @@ const shopOf = (link: string) => new URL(link).hostname.replace(/\.+$/, '').repl
 // Sites whose owners asked GenieBot not to visit (the terms say they can, by email). Set on the server as
 // GENIE_NO_FETCH="shop.example,other.example"; a domain covers its subdomains. Their links can still be added: the
 // wish is named from the link, nothing is fetched, and a redirect into one of them stops there.
-// Each entry is turned into the ASCII form links' hostnames always use, so "bücher.example" as written matches
-// xn--bcher-kva.example; one that isn't a domain at all is dropped.
-const NO_FETCH = (process.env.GENIE_NO_FETCH ?? '').split(',')
-  .map(d => domainToASCII(d.trim().replace(/^\.+|\.+$/g, '')).replace(/^www\./, '')).filter(Boolean);
+/**
+ * GENIE_NO_FETCH's domains, in the ASCII form links' hostnames always use ("bücher.example" as written matches
+ * xn--bcher-kva.example). The ways a domain gets copied out of an email work too ("https://shop.example/",
+ * "shop.example:443", "*.shop.example"). Anything still not a domain stops the server starting, like a bad
+ * GENIE_FETCH_BLOCK: dropping it quietly would leave GenieBot visiting a site that asked it not to.
+ */
+export function parseNoFetch(value: string): string[] {
+  return value.split(',').map(s => s.trim()).filter(Boolean).map(entry => {
+    const bare = entry.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')   // a scheme
+      .replace(/[/?#].*$/, '')                                    // a path, query or fragment
+      .replace(/:\d*$/, '')                                       // a port
+      .replace(/^\*\./, '')                                        // "*." (a domain already covers its subdomains)
+      .replace(/^\.+|\.+$/g, '');
+    const domain = domainToASCII(bare).replace(/^www\./, '');
+    if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(domain)) throw new Error(`GENIE_NO_FETCH: "${entry}" isn't a domain`);
+    return domain;
+  });
+}
+const NO_FETCH = parseNoFetch(process.env.GENIE_NO_FETCH ?? '');
+if (NO_FETCH.length) console.log(`GenieBot stays away from: ${NO_FETCH.join(', ')}`);
 /** Has this host's site asked GenieBot to stay away? */
 export function optedOut(host: string, list: readonly string[] = NO_FETCH): boolean {
   const h = host.toLowerCase().replace(/\.+$/, '');
   return list.some(d => h === d || h.endsWith(`.${d}`));
 }
+const PAGE_BYTES = 512 * 1024, PAGE_IDLE_MS = 3_000;
+/** Does a page's <head> (as far as it's arrived) already give the wish's name and price? Then the rest isn't needed. */
+const hasNameAndPrice = (head: Buffer, page: { url: string; contentType: string }) => {
+  const facts = readPage(decodeHtml(head, page.contentType), page.url);
+  return facts.title !== null && facts.price !== null;
+};
+
 /** cleanUrl, or `fallback` if the link (say, where a redirect went) doesn't pass. */
 function cleanOr(link: string | undefined, fallback: string) {
   try { return link ? cleanUrl(link) : fallback; } catch { return fallback; }
@@ -85,9 +108,10 @@ function cleanOr(link: string | undefined, fallback: string) {
 /**
  * Fetches a pasted link's page and reads the wish from it. Never fails because of the shop (timeouts, errors, bot
  * walls, not a web page): it returns at least the shop and a name guessed from the link. Throws a Problem only for a
- * link that isn't one, or that points somewhere Genie never goes. `vet` is only ever swapped by check-unfurl.ts.
+ * link that isn't one, or that points somewhere Genie never goes. `who` is the account asking (each gets one fetch
+ * at a time); `vet` is only ever swapped by check-unfurl.ts.
  */
-export async function unfurl(raw: unknown, vet: Vet = vetUrl): Promise<Unfurled> {
+export async function unfurl(raw: unknown, { who, vet = vetUrl }: { who?: string; vet?: Vet } = {}): Promise<Unfurled> {
   const pasted = cleanUrl(raw);
   const bare = (link: string): Unfurled => ({ url: link, title: slugTitle(link) ?? slugTitle(pasted), shop: shopOf(link), price: null, currency: null });
   if (optedOut(new URL(pasted).hostname)) return bare(pasted);
@@ -98,9 +122,12 @@ export async function unfurl(raw: unknown, vet: Vet = vetUrl): Promise<Unfurled>
   };
   let page: Fetched;
   try {
+    // Each fetch holds one of the 4 slots, so it's kept short: reading stops at the end of the page's <head> when that
+    // already has the name and the price (many shops put them there for link previews), at 512 KB otherwise, and
+    // after 3 s without a byte from the shop. Whatever arrived by then is still read
     page = await safeFetch(pasted, {
-      accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5', maxBytes: 2 * 1024 * 1024, partial: true,
-      types: ['text/html', 'application/xhtml+xml'],
+      accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5', maxBytes: PAGE_BYTES, partial: true,
+      types: ['text/html', 'application/xhtml+xml'], who, idleMs: PAGE_IDLE_MS, enoughAtHead: hasNameAndPrice,
     }, vetting);
   } catch (e) {
     if (e instanceof Blocked) throw new Problem(BLOCKED);

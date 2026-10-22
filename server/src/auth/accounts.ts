@@ -3,18 +3,21 @@
 // accounts are separate from Arena's and DeckForge's.
 //
 // Security rules followed here:
-//   - passwords: bcrypt (cost 12); 10+ characters; common ones refused
+//   - passwords: bcrypt (cost 12), a few at a time (see withBcrypt); 10+ characters; common ones refused
 //   - a wrong email takes as long to reject as a wrong password, and sign-up / password reset answer the same way
 //     whether or not an account exists (no finding out who has an account)
 //   - email codes: six digits, 10 minutes, one use, five tries (counted before the guess is compared, so parallel
 //     guesses can't skip the count), stored only as a keyed hash; a missing code and a wrong one get the same answer
 //   - sessions and devices: random tokens in cookies, stored only as SHA-256; a password change or reset bumps the
 //     account's session version, which ends every login at once
+//   - every email comes out of a daily allowance (mailer.ts), the asking visitor's own 8 a day first, taken before
+//     finding out whether an account exists. `visitor` below is clientIp(req), for that
 import bcrypt from 'bcryptjs';
-import { LIMITS, type Me } from '@genie/shared';
+import { LIMITS, plainLine, type Me } from '@genie/shared';
 import { one, q, tx } from '../db/index.ts';
-import { Problem } from '../http.ts';
-import { codeMail, FOOTER, sendMail } from './mailer.ts';
+import { Problem, tooMany } from '../http.ts';
+import { limited } from '../ratelimit.ts';
+import { codeMail, FOOTER, sendMail, takeMail } from './mailer.ts';
 import { codeHash, newCode, newToken, sameHash, sha256 } from './security.ts';
 
 /** The login cookie and the trusted-device cookie. */
@@ -24,10 +27,35 @@ const BCRYPT_COST = 12;
 // compared against when an email has no account, so that case takes as long as a wrong password
 const DUMMY_HASH = bcrypt.hashSync(newToken(), BCRYPT_COST);
 
+// bcryptjs is plain JavaScript on the server's one thread, about a quarter of a second per hash, so a flood of logins
+// could keep it busy for everyone. Only 2 run at once and up to 20 more wait their turn (a few seconds at most); past
+// that the answer is "busy" straight away instead of a queue that grows for ever. Every hash and check goes through
+// here, the stand-in check for an email with no account included, so being turned away says nothing about who has one.
+const BCRYPT_AT_ONCE = 2, BCRYPT_QUEUE = 20;
+let bcryptRunning = 0;
+const bcryptWaiting: (() => void)[] = [];
+const BUSY = 'Genie is busy right now. Try again in a moment.';
+async function withBcrypt<T>(work: () => Promise<T>): Promise<T> {
+  if (bcryptRunning < BCRYPT_AT_ONCE) bcryptRunning++;
+  else if (bcryptWaiting.length >= BCRYPT_QUEUE) throw new Problem(BUSY, 503);
+  else await new Promise<void>(go => bcryptWaiting.push(go));   // handed the slot of one that finishes
+  try { return await work(); }
+  finally { const next = bcryptWaiting.shift(); if (next) next(); else bcryptRunning--; }
+}
+const hashPassword = (password: string) => withBcrypt(() => bcrypt.hash(password, BCRYPT_COST));
+const samePassword = (password: unknown, hash: string) => withBcrypt(() => bcrypt.compare(String(password ?? '').slice(0, 200), hash));
+
 // ---------- checking what people type ----------
 export const normEmail = (e: unknown) => String(e ?? '').trim().toLowerCase();
 export function checkEmail(email: string) {
   if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) throw new Problem('Enter a valid email address.');
+}
+/** An email as typed, tidied and checked: done before it goes into a rate limit's key, so a made-up "email" the size of
+ *  a whole request can't be kept as one. */
+export function validEmail(e: unknown): string {
+  const email = normEmail(e);
+  checkEmail(email);
+  return email;
 }
 const COMMON = new Set(['password', 'password1', 'password12', 'password123', 'passw0rd123', '1234567890', '12345678910', 'qwertyuiop', 'qwerty1234',
   '1q2w3e4r5t', 'iloveyou12', 'letmein123', 'genie12345', 'wishlist12', 'wishlist123', 'birthday12', 'birthday123', 'christmas1',
@@ -40,21 +68,20 @@ export function checkPassword(pw: unknown, email = ''): string {
   if (COMMON.has(low) || low === email || low === email.split('@')[0] || /^(.)\1+$/.test(p) || new Set(p).size < 4) throw new Problem('That password is too easy to guess.');
   return p;
 }
-// invisible characters that could hide or flip how a name reads on someone's share page (zero-width and bidi controls);
-// the joiners some scripts and emoji need (U+200C, U+200D) stay
-const INVISIBLE = /[​‎‏؜‪-‮⁠-⁤⁦-⁩﻿]/g;
-/** A display name ("Daniyal's wishlist"): any letters, spaces collapsed, 1 to 40 characters. */
+/** A display name ("Daniyal's wishlist"): any letters, spaces collapsed, 1 to 40 characters. Invisible characters that
+ *  could hide or flip how it reads on someone's share page go, by the same rule as list and wish names (plainLine). */
 export function checkName(n: unknown): string {
-  const name = String(n ?? '').replace(/\p{Cc}/gu, ' ').replace(INVISIBLE, '').replace(/\s+/g, ' ').trim();
+  const name = plainLine(String(n ?? ''));
   if (!name) throw new Problem('Enter your name.');
-  if (name.length > LIMITS.name) throw new Problem(`Keep your name to ${LIMITS.name} characters.`);
+  if ([...name].length > LIMITS.name) throw new Problem(`Keep your name to ${LIMITS.name} characters.`);   // characters, not UTF-16 units: an emoji counts as one
   return name;
 }
 
 // ---------- email codes ----------
 type Purpose = 'signup' | 'login' | 'reset' | 'email';
 
-/** Make a code and email it (replacing any earlier one for the same email and purpose). */
+/** Make a code and email it (replacing any earlier one for the same email and purpose). The caller has already taken
+ *  the email from the day's allowance (takeMail). */
 async function sendCode(email: string, purpose: Purpose, what: string, payload: Record<string, unknown>) {
   const code = newCode();
   await tx(async c => {
@@ -63,7 +90,7 @@ async function sendCode(email: string, purpose: Purpose, what: string, payload: 
       [email, purpose, codeHash(purpose, email, code), payload]);
   });
   const mail = codeMail(code, what);
-  await sendMail(email, mail.subject, mail.text);
+  await sendMail(email, mail.subject, mail.text, { taken: true });
 }
 
 // One answer for a missing, wrong, expired or used-up code: a different one for "no code" would tell anyone poking at
@@ -102,11 +129,12 @@ export function checkSignup(nameIn: unknown, emailIn: unknown, passwordIn: unkno
 }
 
 /** Emails a code; the account is only made once the code comes back (with the name and password hash kept until then). */
-export async function signupStart({ name, email, password }: SignupForm) {
-  const hash = await bcrypt.hash(password, BCRYPT_COST);   // done either way, so both cases take the same time
+export async function signupStart({ name, email, password }: SignupForm, visitor: string) {
+  const hash = await hashPassword(password);   // done either way, so both cases take the same time
+  takeMail({ visitor });   // either way one email goes, so a full day is said the same way to both
   if (await one('select 1 from genie.users where email = $1', [email])) {
     background(sendMail(email, 'Someone tried to sign up with your email',
-      `Someone (hopefully you) tried to make a Genie account with this email address, but it already has one.\n\nLog in instead, or use "Forgot password" if you need a new password.${FOOTER}`));
+      `Someone (hopefully you) tried to make a Genie account with this email address, but it already has one.\n\nLog in instead, or use "Forgot password" if you need a new password.${FOOTER}`, { taken: true }));
     return;
   }
   background(sendCode(email, 'signup', 'finish making your account', { hash, name }));
@@ -130,12 +158,15 @@ export async function signupVerify(emailIn: unknown, code: unknown): Promise<str
 
 // ---------- log in ----------
 /** Checks the password. A trusted device logs straight in; otherwise a code goes to the email. */
-export async function loginStart(emailIn: unknown, passwordIn: unknown, deviceToken?: string): Promise<{ userId: string } | { needCode: true }> {
+export async function loginStart(emailIn: unknown, passwordIn: unknown, deviceToken: string | undefined, visitor: string): Promise<{ userId: string } | { needCode: true }> {
   const email = normEmail(emailIn);
   const user = await one('select id, password from genie.users where email = $1', [email]);
-  const ok = await bcrypt.compare(String(passwordIn ?? '').slice(0, 200), user?.password ?? DUMMY_HASH);
+  const ok = await samePassword(passwordIn, user?.password ?? DUMMY_HASH);
   if (!user?.password || !ok) throw new Problem('Email or password is incorrect.', 401);
   if (await isTrusted(user.id, deviceToken)) return { userId: user.id };
+  // only someone with the password gets here, but it still shouldn't fill the owner's inbox (or the day's emails)
+  if (limited(`logincode:${email}`, 10, 3600_000)) throw tooMany();
+  takeMail({ visitor });
   await sendCode(email, 'login', 'log in on a new device', { userId: user.id });
   return { needCode: true };
 }
@@ -146,9 +177,11 @@ export async function loginVerify(emailIn: unknown, code: unknown): Promise<stri
 }
 
 // ---------- forgotten password ----------
-export async function forgotStart(emailIn: unknown) {
-  const email = normEmail(emailIn);
-  checkEmail(email);
+export async function forgotStart(emailIn: unknown, visitor: string) {
+  const email = validEmail(emailIn);
+  // taken whether or not the email has an account (and so whether or not a code goes), so a full day (or a visitor's
+  // full allowance) is said the same way
+  takeMail({ visitor });
   const user = await one('select id from genie.users where email = $1', [email]);
   if (user) background(sendCode(email, 'reset', 'choose a new password', { userId: user.id }));
 }
@@ -163,7 +196,7 @@ export async function forgotVerify(emailIn: unknown, code: unknown, passwordIn: 
 }
 
 async function newPassword(userId: string, password: string) {
-  const hash = await bcrypt.hash(password, BCRYPT_COST);
+  const hash = await hashPassword(password);
   await tx(async c => {
     await c.query('update genie.users set password = $2, session_version = session_version + 1 where id = $1', [userId, hash]);
     await c.query('delete from genie.sessions where user_id = $1', [userId]);
@@ -233,7 +266,7 @@ export async function setName(userId: string, nameIn: unknown) {
 
 async function checkCurrentPassword(userId: string, password: unknown) {
   const user = await one('select password from genie.users where id = $1', [userId]);
-  if (!user?.password || !(await bcrypt.compare(String(password ?? '').slice(0, 200), user.password))) throw new Problem('Your current password is incorrect.', 401);
+  if (!user?.password || !(await samePassword(password, user.password))) throw new Problem('Your current password is incorrect.', 401);
 }
 
 /** Changes the password; every other login ends. The caller gets a fresh session. */
@@ -252,19 +285,21 @@ export async function logoutEverywhere(userId: string) {
 }
 
 /** Emails a code to the new address; nothing changes until it comes back. */
-export async function changeEmailStart(userId: string, newEmailIn: unknown, password: unknown, oldEmail: string) {
+export async function changeEmailStart(userId: string, newEmailIn: unknown, password: unknown, oldEmail: string, visitor: string) {
   await checkCurrentPassword(userId, password);
-  const email = normEmail(newEmailIn);
-  checkEmail(email);
+  const email = validEmail(newEmailIn);
   if (email === oldEmail) throw new Problem("That's already your email.");
   // an accepted exception to "never say who has an account": only someone logged in who knows their own password gets
   // this far, it's held to 30 tries per 15 minutes per account, and sending a code anyway would mail a stranger for nothing
   if (await one('select 1 from genie.users where email = $1', [email])) throw new Problem('That email already has an account.');
+  // the code goes to an address the account chose, so an account can't use Genie to fill someone else's inbox
+  if (limited(`emailcode:${userId}`, 5, 3600_000) || limited(`emailcode:${email}`, 3, 3600_000)) throw tooMany();
+  takeMail({ visitor });
   await sendCode(email, 'email', 'confirm your new email address', { userId });
 }
 
 export async function changeEmailVerify(userId: string, newEmailIn: unknown, code: unknown, oldEmail: string) {
-  const email = normEmail(newEmailIn);
+  const email = validEmail(newEmailIn);
   const payload = await useCode(email, 'email', code);
   if (payload.userId !== userId) throw new Problem('That code is for a different account.', 403);
   try {
@@ -274,7 +309,8 @@ export async function changeEmailVerify(userId: string, newEmailIn: unknown, cod
     throw e;
   }
   background(sendMail(oldEmail, 'Your email address was changed',
-    `The email address on your Genie account was changed to ${email}.\n\nIf this wasn't you, email mail@daniyalzia.co.uk straight away to get your account back.${FOOTER}`));
+    `The email address on your Genie account was changed to ${email}.\n\nIf this wasn't you, email mail@daniyalzia.co.uk straight away to get your account back.${FOOTER}`,
+    { always: true }));   // sent even on a full day: it's how someone would find out their account was taken
 }
 
 /** Deletes the account and everything in it (the database removes its lists, wishes and grants with it). */

@@ -5,7 +5,7 @@
 // looks at the few tags that matter. A full HTML parser builds a tree, and a crafted page can make that take minutes:
 // node-html-parser needs 26 s for 8,000 nested <div>s (40 KB), and the whole server would stall meanwhile.
 // node-html-parser still decodes the entities.
-import { LIMITS } from '@genie/shared';
+import { LIMITS, plainLine } from '@genie/shared';
 import { TextNode } from 'node-html-parser';
 
 export interface PageFacts {
@@ -103,14 +103,12 @@ const decodeEntities = (s: string) => s.replace(ENTITY, e => new TextNode(e).tex
 /** Text between tags (a <title>), decoded the way browsers do. */
 const decodeText = (s: string) => new TextNode(s).text;
 
-/** Plain one-line text: entities decoded (twice-encoded ones too), tags and invisible characters gone, spaces collapsed. */
+/** Plain one-line text: entities decoded (twice-encoded ones too), tags gone, then the same rule as names people type
+ *  (plainLine: control and invisible characters out, the joiners emoji and some scripts need kept, spaces collapsed). */
 function tidy(s: string | null | undefined): string {
   if (!s) return '';
-  return decodeEntities(decodeEntities(s.slice(0, 1000)))   // cut first: everything after works on a short string
-    .replace(/<\/?[a-z][^<>]*>/gi, ' ')
-    .replace(/[\u0000-\u001f\u007f​-‍⁠﻿]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return plainLine(decodeEntities(decodeEntities(s.slice(0, 1000)))   // cut first: everything after works on a short string
+    .replace(/<\/?[a-z][^<>]*>/gi, ' '));
 }
 /** At most `max` characters, cut at a space when there's one near the end. */
 function cap(s: string, max: number = LIMITS.title): string {

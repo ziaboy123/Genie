@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { SHARE_CODE, type PublicItem, type PublicList, type WishState } from '@genie/shared';
 import { api, ApiError, message } from '../lib/api.ts';
 import { countdown, daysUntil, formatDay, wishMeta } from '../lib/format.ts';
-import { dropGrant, readGrants, saveGrant, writeGrants } from '../lib/grants.ts';
+import { adoptOld, dropGrant, file, forgetPassed, heldFor, readGrants, saveGrant, tokensFor, type Tokens } from '../lib/grants.ts';
 import { Link } from '../lib/router.tsx';
 import { ErrorText, Loading, Note, Page, Sheet, safeHref, useTitle } from '../components/ui.tsx';
 import { ShareFoot } from './Legal.tsx';
@@ -32,32 +32,52 @@ export function Wishlist({ code }: { code: string }) {
   const loadedAt = useRef(0);
 
   const load = useCallback(async () => {
-    const grants = readGrants(code);
+    adoptOld();   // tokens kept the old way (per share code) are filed the new way first
+    const view = (tokens: Tokens) => api<{ list: PublicList }>('w/view', { code, tokens: Object.values(tokens).slice(0, 200) });
+    let opened: string | undefined;
     try {
-      const r = await api<{ list: PublicList }>('w/view', { code, tokens: Object.values(grants).slice(0, 200) });
+      const sent = tokensFor(code);
+      let r = await view(sent);
+      // tokens this browser filed elsewhere for this list (before it got a new link, say): look again with them
+      const { tokens: held, from } = heldFor(r.list.key, code, r.list.items.map(i => i.id));
+      const asked = new Set(Object.values(sent));
+      if (Object.values(held).some(t => !asked.has(t))) r = await view(held);
       loadedAt.current = Date.now();
+      const { key, eventDate, items } = r.list;
+      opened = key;
       // once the day has passed, grants can't be undone, so the keys are no use any more: forget them (the privacy
-      // page says so). Before that, forget tokens that no longer mean anything (the grant was cleared, or someone
-      // else's is there now), and say so if a wish this browser granted has been taken off the list altogether
-      if (r.list.revealed) {
-        if (Object.keys(grants).length) writeGrants(code, {});
-      } else if (!r.list.items.some(i => i.state === 'hidden')) {
-        const byId = new Map(r.list.items.map(i => [i.id, i.state]));
-        const kept: Record<string, string> = {};
+      // page says so). Before that, forget tokens that no longer mean anything, and say why: the grant was cleared
+      // (the owner can clear them all with a new link), or the wish has been taken off the list altogether
+      if (r.list.revealed) file(key, code, eventDate, {}, from);
+      else if (items.some(i => i.state === 'hidden')) file(key, code, eventDate, held, from);   // the owner: nothing to go on
+      else {
+        const byId = new Map(items.map(i => [i.id, i]));
+        const kept: Tokens = {}, cleared: PublicItem[] = [];
         let removed = 0;
-        for (const [id, token] of Object.entries(grants)) {
-          const state = byId.get(id);
-          if (state === 'mine') kept[id] = token;
-          else if (state === undefined) removed++;
-        }
-        if (Object.keys(kept).length !== Object.keys(grants).length) writeGrants(code, kept);
-        if (removed) setNotice(removed === 1 ? 'A wish you granted has been taken off the list, so you can skip that one.' : 'Some wishes you granted have been taken off the list, so you can skip those.');
+        Object.entries(held).forEach(([id, token], n) => {
+          const item = byId.get(id);
+          if (n >= 200 || item?.state === 'mine') kept[id] = token;   // past 200 they weren't sent, so there's no telling
+          else if (!item) removed++;
+          else cleared.push(item);
+        });
+        file(key, code, eventDate, kept, from);
+        const notes = [
+          cleared.length === 1 ? `Your grant on “${cleared[0].title}” was cleared, ${cleared[0].state === 'open' ? "so it's open again. Grant it again if you're still getting it." : 'and someone else has granted it since.'}`
+            : cleared.length ? `Your grants on ${cleared.length} wishes were cleared, so check the list and grant again what you're still getting.` : '',
+          removed === 1 ? 'A wish you granted has been taken off the list, so you can skip that one.'
+            : removed ? 'Some wishes you granted have been taken off the list, so you can skip those.' : '',
+        ].filter(Boolean);
+        if (notes.length) setNotice(notes.join(' '));
       }
-      setList({ ...r.list, items: ordered(r.list.items) });
+      setList({ ...r.list, items: ordered(items) });
       setErr('');
     } catch (x) {
       if (x instanceof ApiError && x.status === 404) setMissing(true);
       else setErr(message(x));
+    } finally {
+      // other lists' tokens, long after their day; never this list's by date alone, since its day may have been moved
+      // (the server's `revealed` above decides for it)
+      forgetPassed({ key: opened, code });
     }
   }, [code]);
 
@@ -81,7 +101,7 @@ export function Wishlist({ code }: { code: string }) {
     setBusy(true); setSheetErr('');
     try {
       const { token } = await api<{ token: string }>('w/grant', { code, itemId: asking.id });
-      saveGrant(code, asking.id, token);
+      if (list) saveGrant(list.key, code, list.eventDate, asking.id, token);
       setState(asking.id, 'mine');
       setAsking(null);
     } catch (x) {
@@ -93,16 +113,17 @@ export function Wishlist({ code }: { code: string }) {
 
   const [undoing, setUndoing] = useState<string | null>(null);
   const undo = async (item: PublicItem) => {
-    const token = readGrants(code)[item.id];
+    if (!list) return;
+    const token = readGrants(list.key)[item.id];
     setNotice(''); setErr('');
     if (!token) { setNotice("This browser can't undo that one any more."); return load(); }
     setUndoing(item.id);
     try {
       await api('w/ungrant', { code, itemId: item.id, token });
-      dropGrant(code, item.id);
+      dropGrant(list.key, item.id);
       setState(item.id, 'open');
     } catch (x) {
-      if (x instanceof ApiError && x.status === 404) { dropGrant(code, item.id); setNotice('That wish has changed since you granted it. Here is the list as it is now.'); load(); }
+      if (x instanceof ApiError && x.status === 404) { dropGrant(list.key, item.id); setNotice('That wish has changed since you granted it. Here is the list as it is now.'); load(); }
       else setErr(message(x));
     } finally { setUndoing(null); }
   };

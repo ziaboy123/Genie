@@ -8,9 +8,10 @@ import { startInactiveSweep } from './auth/inactive.ts';
 import { accountRoutes } from './auth/routes.ts';
 import { BASE, CLIENT_DIST, DEV, HOST, PORT } from './config.ts';
 import { DB_ENABLED, migrate } from './db/index.ts';
-import { send } from './http.ts';
+import { clientIp, send } from './http.ts';
 import { listRoutes } from './lists/routes.ts';
 import { shareMeta } from './lists/store.ts';
+import { limited } from './ratelimit.ts';
 
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml',
@@ -21,13 +22,16 @@ const escapeHtml = (s: string) => s.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0
 
 let indexHtml: string | null = null;
 /** The app's page; a share link's page also says whose list it is, for link previews in WhatsApp, iMessage and so on. */
-async function sendIndex(res: ServerResponse, rel: string) {
+async function sendIndex(req: IncomingMessage, res: ServerResponse, rel: string) {
   if (indexHtml === null || DEV) indexHtml = readFileSync(path.join(CLIENT_DIST, 'index.html'), 'utf8');
   let html = indexHtml;
   const code = rel.match(/^\/w\/([^/]+)\/?$/)?.[1];
   if (code) {
     res.setHeader('X-Robots-Tag', 'noindex, nofollow');   // people's lists never end up in search engines
-    const meta = SHARE_CODE.test(code) && DB_ENABLED ? await shareMeta(code).catch(() => null) : null;
+    // whether the preview is there says whether the code is real, so the lookup gets the same allowance as opening a
+    // list through the API (300 per visitor per 15 minutes): past it the page still loads, just without a preview
+    const meta = SHARE_CODE.test(code) && DB_ENABLED && !limited(`preview:${clientIp(req)}`, 300, 15 * 60_000)
+      ? await shareMeta(code).catch(() => null) : null;
     if (meta) {
       const title = escapeHtml(`${meta.title}`), desc = escapeHtml(`${meta.ownerName}'s wishlist on Genie · ${meta.count} ${meta.count === 1 ? 'wish' : 'wishes'}`);
       // replacer functions: a replacement string would expand $& $` $$ in the owner's title or name ("Gifts under $`10" copied the head in)
@@ -42,7 +46,7 @@ async function sendIndex(res: ServerResponse, rel: string) {
 async function serveClient(req: IncomingMessage, res: ServerResponse, rel: string) {
   if (!existsSync(CLIENT_DIST)) { res.writeHead(404, { 'content-type': 'text/plain' }); res.end('The browser app isn\'t built. In development use `npm run dev`; for production run `npm run build`.'); return; }
   const file = path.join(CLIENT_DIST, path.normalize(rel).replace(/^(\.\.[/\\])+/, ''));
-  if (!file.startsWith(CLIENT_DIST + path.sep) || !existsSync(file) || statSync(file).isDirectory() || file.endsWith('index.html')) return sendIndex(res, rel);   // app routes
+  if (!file.startsWith(CLIENT_DIST + path.sep) || !existsSync(file) || statSync(file).isDirectory() || file.endsWith('index.html')) return sendIndex(req, res, rel);   // app routes
   const hashed = /[-.][A-Za-z0-9_]{8,}\.(js|css|woff2)$/.test(file);
   res.writeHead(200, { 'content-type': TYPES[path.extname(file)] ?? 'application/octet-stream', 'cache-control': hashed ? 'public, max-age=31536000, immutable' : 'no-cache' });
   createReadStream(file).on('error', () => res.destroy()).pipe(res);

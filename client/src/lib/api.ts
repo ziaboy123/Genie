@@ -1,7 +1,8 @@
 // Talking to Genie's API. Same-origin only; the login cookie is HttpOnly, so scripts never see it.
 import type { Me } from '@genie/shared';
 
-export class ApiError extends Error { constructor(message: string, readonly status: number) { super(message); } }
+/** A failed call. `fromServer`: the message is Genie's own (not one made up here because none came back). */
+export class ApiError extends Error { constructor(message: string, readonly status: number, readonly fromServer = false) { super(message); } }
 
 const API = `${import.meta.env.BASE_URL}api/`;   // "/genie/api/"
 
@@ -18,7 +19,8 @@ export async function api<T = { ok: true; me?: Me | null }>(path: string, body: 
     // a 401 can mean the login ran out, or just a wrong password: the session checks which
     if (res.status === 401) dispatchEvent(new Event('genie:recheck'));
     const fallback = res.status >= 500 ? "Genie isn't answering right now. Try again in a moment." : 'Something went wrong. Try again in a moment.';
-    throw new ApiError(typeof data.error === 'string' ? data.error : fallback, res.status);
+    const own = typeof data.error === 'string';
+    throw new ApiError(own ? data.error : fallback, res.status, own);
   }
   return data as T;
 }
@@ -35,7 +37,8 @@ export async function fetchMe(): Promise<{ accounts: boolean; me: Me | null }> {
 /** The message to show for a failed call. */
 export const message = (e: unknown) => (e instanceof ApiError ? e.message : 'Something went wrong. Try again in a moment.');
 
-/** The same, for signing up and logging in, which the server switches off (503) when it can't send emails. */
+/** The same, for signing up and logging in. A 503 from Genie says why itself (busy, no more emails today, switched off);
+ *  one with no message (Genie itself not answering) gets a general one. */
 export const authMessage = (e: unknown) =>
-  e instanceof ApiError && e.status === 503 ? 'Signing up and logging in are switched off for a moment.' : message(e);
+  e instanceof ApiError && e.status === 503 && !e.fromServer ? 'Signing up and logging in are switched off for a moment.' : message(e);
 

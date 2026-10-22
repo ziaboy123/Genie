@@ -166,10 +166,25 @@ async function main() {
   assert.deepEqual(reordered, [...ids].reverse());
   section('Lists and wishes');
 
+  // ----- names keep to one plain line: the same rule as titles read from shops' pages (check-unfurl.ts has the rest) -----
+  const ENGLAND = '\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}', FAMILY = '👩\u200D👩\u200D👧';
+  for (const [typed, kept] of [
+    ['Nike\u2060\u061C\u2061 Air\u00AD \u{E0041}Max\u3164', 'Nike Air Max'],   // invisible and direction marks the old list missed
+    [`${FAMILY} ${ENGLAND} mug`, `${FAMILY} ${ENGLAND} mug`],                   // emoji and flags stay whole
+    [`W${'\u0333'.repeat(119)}`, `W${'\u0333'.repeat(4)}`],                       // a pile of accents is cut to 4
+  ] as const) assert.equal((await owner.ok('items/update', { id: second.id, title: typed })).item.title, kept, JSON.stringify(typed));
+  assert.equal((await owner.call('items/update', { id: second.id, title: '\u200B\u2060\u061C' })).status, 400, 'nothing visible is no name');
+  assert.equal((await owner.ok('lists/update', { id: list.id, title: '\u202EBirthday\u202C 2026\u061C' })).list.title, 'Birthday 2026');
+  await owner.ok('items/update', { id: second.id, title: 'Heavyweight hoodie (black, M)' });
+  section('Plain names');
+
   // ----- the share page and grants -----
   const visitor = new Browser(), other = new Browser();
   const code = list.shareCode;
   let view = (await visitor.ok('w/view', { code, tokens: [] })).list;
+  const listKey = view.key;
+  assert.match(listKey, /^[A-Za-z0-9_-]{22}$/, 'a list key for filing undo tokens');
+  assert.ok(!listKey.includes(list.id) && listKey !== code, "it isn't the list's id or its code");
   assert.equal(view.isOwner, false);
   assert.equal(view.ownerName, 'Daniyal');
   assert.ok(view.items.every((i: any) => i.state === 'open'));
@@ -201,6 +216,10 @@ async function main() {
   const relinked = (await owner.ok('lists/new-link', { id: list.id })).list;
   assert.notEqual(relinked.shareCode, code);
   assert.equal((await anon.call('w/view', { code, tokens: [] })).status, 404);
+  // the list key stays, so a granter's browser still finds its token, and the token still counts as theirs
+  const afterLink = (await visitor.ok('w/view', { code: relinked.shareCode, tokens: [kept] })).list;
+  assert.equal(afterLink.key, listKey, 'the list key survives a new link');
+  assert.equal(afterLink.items.find((i: any) => i.id === second.id).state, 'mine', 'and so does Yours / Undo');
   const stateOn = async (c: string) => (await other.ok('w/view', { code: c, tokens: [] })).list.items.find((i: any) => i.id === second.id).state;
   assert.equal(await stateOn(relinked.shareCode), 'granted', 'a plain new link keeps grants');
   assert.equal((await stranger.call('lists/new-link', { id: list.id, clearGrants: true })).status, 404, "nobody else can relink or clear a list");
@@ -214,6 +233,7 @@ async function main() {
 
   // ----- one visitor can grant only so many wishes on one list a day (a leaked link can't mark the whole list) -----
   const capList = (await owner.ok('lists/create', { title: 'Lots of wishes', eventDate: isoDay(20) })).list;
+  assert.notEqual((await anon.ok('w/view', { code: capList.shareCode, tokens: [] })).list.key, listKey, 'each list has its own key');
   const capIds: string[] = [];
   for (let i = 0; i < 12; i++)
     capIds.push((await owner.ok('items/add', { listId: capList.id, url: `https://no-such-shop-genie-check.co.uk/products/cap-wish-${i}` })).item.id);
@@ -234,6 +254,66 @@ async function main() {
   for (let i = 0; i < 10; i++) assert.equal((await late.call('w/grant', { code: capList.shareCode, itemId: capIds[1] })).status, 409);
   await late.ok('w/grant', { code: capList.shareCode, itemId: capIds[11] });
   section('Grant cap');
+
+  // ----- the browser's undo tokens: client/src/lib/grants.ts, run here against a stand-in for localStorage -----
+  {
+    const store = new Map<string, string>();
+    (globalThis as any).localStorage = {
+      get length() { return store.size; },
+      key: (i: number) => [...store.keys()][i] ?? null,
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => { store.set(k, String(v)); },
+      removeItem: (k: string) => { store.delete(k); },
+    };
+    const grantsFile = '../client/src/lib/grants.ts';   // not a literal, so the server's typecheck leaves the browser code alone
+    const G = await import(grantsFile);
+    const entry = (key: string) => JSON.parse(store.get(`genie:undo:${key}`) ?? 'null');
+
+    // a list moved to a later day keeps its Undo: the share page doesn't clear the open list's tokens by the day it
+    // last saw (that used to happen before the page even asked the server), only when the server says it has passed
+    const moving = (await owner.ok('lists/create', { title: 'Moved party', eventDate: isoDay(1) })).list;
+    const wish = (await owner.ok('items/add', { listId: moving.id, url: 'https://no-such-shop-genie-check.co.uk/products/party-hat' })).item;
+    const seen = (await visitor.ok('w/view', { code: moving.shareCode, tokens: [] })).list;
+    const { token: hat } = await visitor.ok('w/grant', { code: moving.shareCode, itemId: wish.id });
+    G.saveGrant(seen.key, moving.shareCode, seen.eventDate, wish.id, hat);
+    assert.equal((await owner.ok('lists/update', { id: moving.id, eventDate: isoDay(14) })).list.eventDate, isoDay(14), 'moved with a grant in place');
+    // two days later the browser opens it again (the steps Wishlist.tsx's load() takes)
+    const later = isoDay(2);
+    G.adoptOld();
+    const sent = G.tokensFor(moving.shareCode);
+    assert.deepEqual(sent, { [wish.id]: hat }, 'the token is still there to send, though the day it was saved with has gone');
+    const after = (await visitor.ok('w/view', { code: moving.shareCode, tokens: Object.values(sent) })).list;
+    assert.equal(after.revealed, false);
+    assert.equal(after.items.find((i: any) => i.id === wish.id).state, 'mine', 'so it still shows as Yours, with Undo');
+    const { tokens, from } = G.heldFor(after.key, moving.shareCode, after.items.map((i: any) => i.id));
+    G.file(after.key, moving.shareCode, after.eventDate, tokens, from);
+    G.forgetPassed({ key: after.key, code: moving.shareCode }, later);
+    assert.deepEqual(entry(seen.key), { c: moving.shareCode, d: isoDay(14), t: { [wish.id]: hat } }, 'kept, with the new day');
+    G.forgetPassed({ key: after.key, code: moving.shareCode }, isoDay(400));
+    assert.ok(entry(seen.key), "the open list's tokens are never cleared by date alone");
+
+    // other lists' tokens go 30 days after the day this browser last saw for them
+    for (const [key, d] of [['kept-a', '2026-11-01'], ['gone-b', '2026-10-31']]) store.set(`genie:undo:${key}`, JSON.stringify({ c: `${key.slice(0, 4)}CODE`, d, t: { w: 'token' } }));
+    G.forgetPassed({ code: 'ZZZZZZZZ' }, '2026-12-01');
+    assert.ok(entry('kept-a') && !entry('gone-b'), '30 days after the day: kept; 31: cleared');
+    G.forgetPassed({ code: 'ZZZZZZZZ' }, isoDay(30));
+    assert.ok(entry(seen.key), 'the moved list, not open now, is kept until 30 days after its new day');
+
+    // tokens kept the old way (per share code) join what's there, never replace it, even when an old tab writes again
+    store.set(`genie:grants:${moving.shareCode}`, JSON.stringify({ w1: 't1' }));
+    G.adoptOld();
+    store.set(`genie:grants:${moving.shareCode}`, JSON.stringify({ w2: 't2' }));
+    G.adoptOld();
+    assert.deepEqual(entry(seen.key).t, { [wish.id]: hat, w1: 't1', w2: 't2' }, 'merged into the list they belong to');
+    assert.equal(store.get(`genie:grants:${moving.shareCode}`), undefined);
+    store.set('genie:grants:BBBBBBBB', JSON.stringify({ q: 'r' }));
+    G.adoptOld();
+    store.set('genie:grants:BBBBBBBB', JSON.stringify({ s: 't' }));
+    G.adoptOld();
+    assert.deepEqual(entry('old-BBBBBBBB').t, { q: 'r', s: 't' }, 'a list not opened yet: merged under a stand-in key');
+    delete (globalThis as any).localStorage;
+  }
+  section('Undo tokens in the browser');
 
   // ----- the reveal (a list whose day was yesterday) -----
   const past = (await owner.ok('lists/create', { title: 'Yesterday', eventDate: isoDay(-1) })).list;
@@ -261,6 +341,17 @@ async function main() {
       assert.ok(h.includes(`<meta property="og:title" content="${esc}">`), `og:title for ${t}`);
       assert.equal(h.match(/<head>/g)?.length, 1, `one <head> for ${t}`);
     }
+    // whether a preview is there says whether a code is real, so looking codes up is limited per visitor like opening
+    // a list (300 per 15 minutes): past that the page still loads, just without a preview
+    const prober = { 'cf-connecting-ip': '203.0.113.50' };
+    const guesses = Array.from({ length: 300 }, () => randomBytes(6).toString('base64url').replace(/[-_]/g, 'x'));
+    for (let i = 0; i < guesses.length; i += 25)
+      await Promise.all(guesses.slice(i, i + 25).map(async g => (await fetch(`${BASE}/w/${g}`, { headers: prober })).text()));
+    const over = await fetch(`${BASE}/w/${cleared.shareCode}`, { headers: prober });
+    assert.equal(over.status, 200, 'the page still loads');
+    assert.ok(!/og:title/.test(await over.text()), 'no preview past the limit, even for a real code');
+    const someoneElse = await (await fetch(`${BASE}/w/${cleared.shareCode}`, { headers: { 'cf-connecting-ip': '203.0.113.51' } })).text();
+    assert.match(someoneElse, /og:title/, 'other visitors still get previews');
     section('Link previews');
   } else console.log('(client not built: skipped link previews)');
 

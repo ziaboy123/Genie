@@ -1,6 +1,6 @@
 # Handling reports, complaints and takedowns
 
-For Daniyal, who is the person accountable for Genie's online safety. Written 20 October 2026, updated 21 October 2026. It turns what the Terms and Privacy page promise into steps.
+For Daniyal, who is the person accountable for Genie's online safety. Written 20 October 2026, updated 22 October 2026. It turns what the Terms and Privacy page promise into steps.
 
 ## What arrives, and where
 
@@ -101,7 +101,7 @@ The law: UK providers must report CSEA content they find to the National Crime A
 
 ## GenieBot exclusion requests
 
-Add the domain to `GENIE_NO_FETCH` in the service's environment (comma-separated; a domain covers its subdomains), restart Genie, and reply. Wishes from that site can still be added; they're just named from the link.
+Add the domain to `GENIE_NO_FETCH` in the service's environment (comma-separated; a domain covers its subdomains, and it can be pasted as `https://shop.example/`, `shop.example:443` or `*.shop.example`), restart Genie, check that `journalctl -u genie -n 20` has a `GenieBot stays away from:` line that includes the domain (anything that isn't a domain stops Genie starting, so `systemctl is-active genie` must say `active`), and reply. Wishes from that site can still be added; they're just named from the link.
 
 ## The log
 

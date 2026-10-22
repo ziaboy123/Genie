@@ -6,7 +6,7 @@ import { BASE, Link, navigate } from '../lib/router.tsx';
 import { Page, TopBar, useTitle } from '../components/ui.tsx';
 
 const EMAIL = 'mail@daniyalzia.co.uk';
-const UPDATED = '21 October 2026';
+const UPDATED = '22 October 2026';
 const mailto = (subject: string, body?: string) =>
   `mailto:${EMAIL}?subject=${encodeURIComponent(subject)}${body ? `&body=${encodeURIComponent(body)}` : ''}`;
 const Mail = ({ subject, children = EMAIL }: { subject?: string; children?: ReactNode }) =>
@@ -42,8 +42,13 @@ export function ShareFoot({ code, isOwner }: { code: string; isOwner: boolean })
 
 function Doc({ title, children }: { title: string; children: ReactNode }) {
   useTitle(title);
-  // a link straight to a section (GenieBot's user agent points at #geniebot): the page only exists once React has drawn it
-  useEffect(() => { if (location.hash) document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView(); }, []);
+  // a link straight to a section (GenieBot's user agent points at #geniebot): the page only exists once React has drawn it.
+  // A mangled link ("#%E0%A4%A") just doesn't scroll anywhere
+  useEffect(() => {
+    let id = location.hash.slice(1);
+    try { id = decodeURIComponent(id); } catch { /* not valid %-escapes: look for it as it is */ }
+    if (id) document.getElementById(id)?.scrollIntoView();
+  }, []);
   return (
     <Page className="doc">
       <TopBar left={<button type="button" className="back linkbtn" onClick={() => (history.length > 1 ? history.back() : navigate('/'))}>← Back</button>} />
@@ -87,7 +92,7 @@ export function Privacy() {
       <p>When you add a link, Genie's server visits that page once to read the product's name and price. The shop sees one visit from Genie's server, which says it's "GenieBot", not from you or the people you share with. When people open your list, nothing is loaded from shops. If they tap a wish, the shop's page opens in their browser like any other link, and Genie doesn't tell the shop where they came from.</p>
 
       <h2>Spam and security</h2>
-      <p>To slow down password guessing and spam, Genie counts recent attempts by IP address (and, for sign-ups, logins and password resets, by email address). These counts are kept only in the server's memory and are forgotten within about an hour, except how many wishes an address has granted on each list, which is forgotten after a day. Genie's server doesn't keep a log of visits.</p>
+      <p>To slow down password guessing and spam, Genie counts recent attempts by IP address (and, for sign-ups, logins, password resets and email changes, by email address too). These counts are kept only in the server's memory and are forgotten within about an hour, except two that are forgotten after a day: how many wishes an address has granted on each list, and how many emails an address has asked Genie to send (up to 8 a day, so nobody can use up the day's emails for everyone else). Genie's server doesn't keep a log of visits.</p>
 
       <h2>Emails</h2>
       <p>Genie only emails you codes (for signing up, logging in on a new device, changing your email and resetting your password), notices about your account (like your email being changed) and, if you stop using Genie, one warning before your account is deleted. No newsletters and no marketing. Emails are sent through Resend from its servers in the EU.</p>
@@ -118,7 +123,7 @@ export function Privacy() {
         <li><strong>Logins:</strong> 30 days after you last use them. <strong>Trusted devices:</strong> 30 days.</li>
         <li><strong>Email codes:</strong> they work for 10 minutes and are cleared out within a day.</li>
         <li><strong>Grants:</strong> until they're undone, the wish or list is deleted, or the owner reuses the list after the day.</li>
-        <li><strong>Spam counts:</strong> forgotten within about an hour (grants on each list: after a day).</li>
+        <li><strong>Spam counts:</strong> forgotten within about an hour (grants on each list, and emails asked for: after a day).</li>
         <li><strong>Backups:</strong> the database is backed up every night and each backup is kept for 14 days, so anything deleted is gone from backups within 14 days.</li>
         <li><strong>Reports and complaints:</strong> the emails are kept for 6 months after they're dealt with (a year if the next point applies). A short log without names is kept.</li>
         <li><strong>Reports to the National Crime Agency:</strong> if content has to be reported, the law says a copy of it and the account details that go with it must be kept, securely, for a year.</li>
@@ -128,7 +133,7 @@ export function Privacy() {
       <ul>
         <li><strong>genie_session</strong> keeps you logged in, for up to 30 days.</li>
         <li><strong>genie_device</strong> remembers a device you trust for 30 days, so it doesn't need an emailed code. It's set when you sign up, or when you log in with "Trust this device" left ticked.</li>
-        <li><strong>Your browser's storage</strong> keeps the keys for wishes you've granted, so you can undo them. After the list's day they can't be undone, so the keys are cleared the next time you open the list. While you log in, the tab also remembers which page to take you back to.</li>
+        <li><strong>Your browser's storage</strong> keeps the keys for wishes you've granted, with the list's link and date, so you can undo them (even after the owner makes a new link). After the list's day they can't be undone, so the keys are cleared when you next open that list. Keys for a list you don't open again are cleared the next time you open any list on Genie, once 30 days have passed since its day (in case the owner moved it to a later date). While you log in, the tab also remembers which page to take you back to.</li>
       </ul>
       <p>Both cookies are only sent to Genie, over a secure connection, and can't be read by scripts on the page. All of this is strictly necessary for things you ask for (staying logged in, undoing a grant), so the law doesn't require asking for your consent, and that's why there's no cookie banner. There are no analytics or advertising cookies, and if you've never logged in on a browser, Genie sets no cookies in it.</p>
 

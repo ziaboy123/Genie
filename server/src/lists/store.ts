@@ -6,7 +6,7 @@
 //   - grants are anonymous: only the SHA-256 of the granter's undo token is kept, never who they are
 //   - the owner sees nothing about grants until the day after the list's date (London time), not even a count
 import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
-import { LIMITS, SHARE_CODE, type ListSummary, type OwnerItem, type OwnerList, type PublicItem, type PublicList } from '@genie/shared';
+import { LIMITS, plainLine, SHARE_CODE, type ListSummary, type OwnerItem, type OwnerList, type PublicItem, type PublicList } from '@genie/shared';
 import { one, q, tx } from '../db/index.ts';
 import { Problem } from '../http.ts';
 import { cleanUrl, unfurl } from '../unfurl/index.ts';
@@ -43,9 +43,9 @@ function checkDate(v: unknown, min: string): string {
 }
 
 // ---------- checking what people send ----------
-// control characters and the invisible marks that flip text direction (they can disguise a name or a shop)
-const INVISIBLE = /[\u0000-\u001f\u007f-\u009f​‎‏‪-‮⁦-⁩﻿]/g;
-const tidy = (v: unknown) => (typeof v === 'string' ? v : '').replace(INVISIBLE, ' ').replace(/\s+/g, ' ').trim();
+// control characters and invisible ones (zero-width, direction marks…), which could disguise a name or a shop, and
+// piles of accents: the same rule for names typed here and titles read from shops' pages (plainLine, in shared/api.ts)
+const tidy = (v: unknown) => plainLine(typeof v === 'string' ? v : '');
 /** Counted in characters, not UTF-16 units, so an emoji counts as one. */
 const length = (s: string) => [...s].length;
 
@@ -56,8 +56,8 @@ function checkTitle(v: unknown, empty: string): string {
   if (length(title) > LIMITS.title) throw new Problem(`Keep the name to ${LIMITS.title} characters or fewer.`);
   return title;
 }
-/** Text from a shop's page: cut to fit rather than refused. */
-const fit = (v: unknown, max: number) => [...tidy(v)].slice(0, max).join('').trim();
+/** Text from a shop's page: cut to fit rather than refused (and tidied again, in case the cut split a flag or an emoji). */
+const fit = (v: unknown, max: number) => tidy([...tidy(v)].slice(0, max).join(''));
 
 /** A price in pence, from nothing up to the limit. */
 function checkPrice(v: unknown): number {
@@ -231,7 +231,8 @@ export async function addItem(userId: string, body: Record<string, unknown>): Pr
   if (before.n >= LIMITS.itemsPerList) throw full();
   if (before.dup) throw already();
 
-  const page = await unfurl(pasted);   // never fails for a shop that blocks us: it still has the shop and a guessed name
+  // never fails for a shop that blocks us: it still has the shop and a guessed name. One fetch at a time per account
+  const page = await unfurl(pasted, { who: userId });
   // the link after any redirects (a short link becomes the real product page), if it's a sound one
   let url = pasted;
   try { url = cleanUrl(page.url); } catch { /* keep what was pasted */ }
@@ -326,6 +327,10 @@ export async function shareMeta(code: string): Promise<{ title: string; ownerNam
   return row ? { title: row.title, ownerName: row.owner_name, count: row.count } : null;
 }
 
+/** The list's key on the share page: the same after a new link, so visitors' browsers can keep their undo tokens for
+ *  it. Derived from the list's id (random, never shown to visitors), and no use for anything else. */
+const listKey = (id: string) => createHash('sha256').update(`genie list key ${id}`).digest('base64url').slice(0, 22);
+
 /** The undo tokens a browser holds for this list: at most 200 short strings (anything else is ignored). */
 const cleanTokens = (v: unknown): string[] =>
   (Array.isArray(v) ? v : []).filter((t): t is string => typeof t === 'string' && t.length > 0 && t.length <= 64).slice(0, 200);
@@ -346,7 +351,7 @@ export async function viewList(code: unknown, tokens: unknown, viewerId: string 
   }));
   // wishes someone else granted sink to the bottom (sort is stable). Never for the owner: the order would give it away
   if (!hidden) items.sort((a, b) => Number(a.state === 'granted') - Number(b.state === 'granted'));
-  return { title: list.title, ownerName: list.owner_name, eventDate: list.event_date, revealed, isOwner, items };
+  return { key: listKey(list.id), title: list.title, ownerName: list.owner_name, eventDate: list.event_date, revealed, isOwner, items };
 }
 
 // ---------- grants per visitor per list ----------

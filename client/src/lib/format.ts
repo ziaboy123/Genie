@@ -83,6 +83,14 @@ export function isoDay(addDays = 0, addYears = 0): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
+const LONDON = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit' });
+/** Today in London (plus some years), as YYYY-MM-DD: grants stop being secret when the day after a list's day starts
+ *  there, wherever the visitor is. */
+export function londonDay(addYears = 0): string {
+  const p = Object.fromEntries(LONDON.formatToParts(new Date()).map(x => [x.type, x.value]));
+  return `${Number(p.year) + addYears}-${p.month}-${p.day}`;
+}
+
 /** Is this a real day, from yesterday to two years ahead (what the server accepts)? */
 export function okEventDate(iso: string): boolean {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) return false;

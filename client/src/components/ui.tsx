@@ -1,6 +1,6 @@
 // Pieces every page uses: the page frame, the top bar, form fields, the code box, pop-up sheets, copy buttons.
-import { useEffect, useId, useRef, useState, type InputHTMLAttributes, type ReactNode } from 'react';
-import { Link } from '../lib/router.tsx';
+import { Component, useEffect, useId, useRef, useState, type InputHTMLAttributes, type ReactNode } from 'react';
+import { BASE, Link } from '../lib/router.tsx';
 import { useSession } from '../lib/session.tsx';
 
 /** Sets the browser tab's title while the page is open. */
@@ -12,6 +12,28 @@ export function useTitle(title: string) {
  *  below the column (the site footer, on the pages that have one). */
 export function Page({ children, slim = false, className = '', foot }: { children: ReactNode; slim?: boolean; className?: string; foot?: ReactNode }) {
   return <div className="page"><main className={`col ${slim ? 'slim' : ''} ${className}`}>{children}</main>{foot}</div>;
+}
+
+/** Around the whole app: a page that breaks shows a short apology instead of going blank. Plain markup only, since
+ *  whatever broke might be something the usual pieces rely on (the login, the router). Reloading drops any #part of
+ *  the address, in case that's what it tripped over. */
+export class CrashGuard extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() { return { failed: true }; }
+  componentDidCatch(e: unknown) { console.error('Genie: a page broke', e); }
+  render() {
+    if (!this.state.failed) return this.props.children;
+    return (
+      <div className="page"><main className="col slim notfound">
+        <div className="notfound-body">
+          <h1 className="title">Something went wrong</h1>
+          <p className="lede">This page hit a problem. Reloading usually sorts it out.</p>
+          <button type="button" className="btn" onClick={() => location.assign(location.pathname + location.search)}>Reload</button>
+          <a href={`${BASE}/`} className="strong-link">Go to Genie's home page</a>
+        </div>
+      </main></div>
+    );
+  }
 }
 
 /** The "Genie" wordmark: to your lists when logged in, otherwise Home. */

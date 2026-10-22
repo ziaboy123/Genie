@@ -9,6 +9,7 @@ import http, { type IncomingMessage } from 'node:http';
 import https from 'node:https';
 import { BlockList, isIP, type LookupFunction } from 'node:net';
 import { rootCertificates } from 'node:tls';
+import { domainToASCII } from 'node:url';
 import zlib from 'node:zlib';
 
 const HEADERS_MS = 5_000, TOTAL_MS = 8_000, MAX_REDIRECTS = 3;
@@ -47,19 +48,128 @@ for (const [net, bits] of [
 const PUBLIC_V6 = new BlockList();
 PUBLIC_V6.addSubnet('2000::', 3, 'ipv6');
 // GENIE_FETCH_BLOCK adds more, comma-separated (e.g. the home's own public address, which from inside can loop back to the router)
+const STATIC_BLOCK: string[] = [];
 for (const entry of (process.env.GENIE_FETCH_BLOCK ?? '').split(',').map(s => s.trim()).filter(Boolean)) {
   const [address, bits, extra] = entry.split('/');
   const v = isIP(address);
   if (!v || extra !== undefined || (bits !== undefined && !/^\d{1,3}$/.test(bits))) throw new Error(`GENIE_FETCH_BLOCK: "${entry}" isn't an address or a range`);
   (v === 4 ? BLOCKED_V4 : BLOCKED_V6).addSubnet(address, bits === undefined ? (v === 4 ? 32 : 128) : Number(bits), v === 4 ? 'ipv4' : 'ipv6');
+  STATIC_BLOCK.push(entry);
 }
 
-/** Is this address anywhere but the public internet? (Anything that isn't an address at all counts as blocked.) */
-export function isBlockedAddress(address: string): boolean {
+// ---------- names whose addresses are off limits too ----------
+// The home's public address changes now and then (it's a home broadband line), so a fixed GENIE_FETCH_BLOCK entry
+// would quietly go stale. GENIE_FETCH_BLOCK_HOSTS names it instead (comma-separated, e.g. a dynamic DNS name), and
+// whatever those names point to is blocked as well, looked up at start-up and every 5 minutes. The lookups go to
+// public DNS servers, because the home network's own DNS may answer with a private address for its own names.
+// It never fails open: a lookup that fails keeps the last addresses that worked, and until every name has been
+// found once, nothing is fetched at all (wishes are named from their links meanwhile).
+const REFRESH_MS = 5 * 60_000, RETRY_MS = 30_000;
+
+/** Looks up a name's addresses: a Resolver, or check-unfurl.ts's stand-in. */
+export interface HostLookup {
+  resolve4(host: string): Promise<string[]>;
+  resolve6(host: string): Promise<string[]>;
+}
+const publicDns = (): HostLookup => {
+  const resolver = new Resolver({ timeout: 3_000, tries: 2 });
+  resolver.setServers(['1.1.1.1', '8.8.8.8']);
+  return resolver;
+};
+
+/** GENIE_FETCH_BLOCK_HOSTS's names, in ASCII, each once. Anything that isn't a host name stops the server starting. */
+export function parseBlockHosts(value: string): string[] {
+  const hosts = value.split(',').map(s => s.trim()).filter(Boolean).map(entry => {
+    if (isIP(entry)) throw new Error(`GENIE_FETCH_BLOCK_HOSTS: "${entry}" is an address (those go in GENIE_FETCH_BLOCK)`);
+    const host = domainToASCII(entry.replace(/\.+$/, ''));   // lower case too
+    if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host)) throw new Error(`GENIE_FETCH_BLOCK_HOSTS: "${entry}" isn't a host name`);
+    return host;
+  });
+  // a name written twice ("mc.example, MC.example.") would be looked up once but waited for twice, so nothing would
+  // ever be fetched
+  return [...new Set(hosts)];
+}
+
+/** The addresses some names point to, kept up to date (see above). */
+export class HostBlock {
+  /** The last answer that worked, for each name. */
+  private readonly found = new Map<string, { v4: string[]; v6: string[] }>();
+  private v4 = new BlockList();
+  private v6 = new BlockList();
+  private readonly failing = new Set<string>();
+  private logged = '';
+  constructor(readonly hosts: readonly string[], private readonly lookup: () => HostLookup = publicDns,
+    private readonly log: (line: string) => void = console.log, private readonly fixed: readonly string[] = []) {}
+
+  /** True once every name has been found (straight away when there are none). Until then, nothing is fetched. */
+  get ready() { return this.found.size === this.hosts.length; }
+  /** Is this address one the names point to? */
+  has(address: string, family: 4 | 6) { return family === 4 ? this.v4.check(address, 'ipv4') : this.v6.check(address, 'ipv6'); }
+  addresses() { return this.hosts.flatMap(h => { const f = this.found.get(h); return f ? [...f.v4, ...f.v6] : []; }); }
+
+  /** Looks every name up again. A name that can't be looked up keeps its last addresses. */
+  async refresh(): Promise<void> {
+    const dns = this.lookup();
+    await Promise.all(this.hosts.map(async host => {
+      // no records of one kind (ENODATA) is an answer; anything else (a timeout, no such name) is a failure
+      const ask = (query: Promise<string[]>) => query.then(list => list.filter(a => isIP(a)), (e: any) => (e?.code === 'ENODATA' ? [] : e?.code ?? 'error'));
+      const [v4, v6] = await Promise.all([ask(dns.resolve4(host)), ask(dns.resolve6(host))]);
+      const last = this.found.get(host);
+      const next = { v4: Array.isArray(v4) ? v4 : last?.v4 ?? [], v6: Array.isArray(v6) ? v6 : last?.v6 ?? [] };
+      const problem = !Array.isArray(v4) ? v4 : !Array.isArray(v6) ? v6 : null;
+      if (!next.v4.length && !next.v6.length) {
+        // a name with no address at all is broken, not a reason to stop blocking what it pointed to
+        if (!this.failing.has(host)) this.log(`fetch block: couldn't look up ${host} (${problem ?? 'no addresses'}); ${last ? 'keeping its last addresses' : 'no links are fetched until it can be'}`);
+        this.failing.add(host);
+        return;
+      }
+      if (problem && !this.failing.has(host)) this.log(`fetch block: couldn't look up all of ${host}'s addresses (${problem}); the rest stay as they were`);
+      if (problem) this.failing.add(host);
+      else if (this.failing.delete(host)) this.log(`fetch block: ${host} looked up again`);
+      this.found.set(host, next);
+    }));
+    const v4 = new BlockList(), v6 = new BlockList();
+    for (const address of this.addresses()) {
+      if (isIP(address) === 4) v4.addAddress(address, 'ipv4');
+      else v6.addAddress(address, 'ipv6');
+    }
+    this.v4 = v4;
+    this.v6 = v6;
+    this.show();
+  }
+
+  /** Logs every address that's blocked on top of the private ranges, at start-up and whenever that changes. */
+  show() {
+    const line = [...new Set([...this.fixed, ...this.addresses()])].join(', ');
+    if (line && line !== this.logged) this.log(`fetch block: ${line}`);
+    this.logged = line;
+  }
+
+  /** Looks the names up now and every 5 minutes (every 30 s until they've all been found). */
+  start() {
+    this.show();
+    if (!this.hosts.length) return;
+    const tick = async () => {
+      await this.refresh().catch(e => this.log(`fetch block: lookup failed: ${e?.message ?? e}`));
+      setTimeout(tick, this.ready ? REFRESH_MS : RETRY_MS).unref();
+    };
+    tick();
+  }
+}
+const HOME = new HostBlock(parseBlockHosts(process.env.GENIE_FETCH_BLOCK_HOSTS ?? ''), publicDns, console.log, STATIC_BLOCK);
+HOME.start();
+// on the home server one of them is always needed (the runbook sets both), so their going missing from the .env is
+// worth a line in the journal. Only a warning: GenieBot still never reaches the private ranges without them
+if (process.env.NODE_ENV === 'production' && !STATIC_BLOCK.length && !HOME.hosts.length)
+  console.warn("fetch block: neither GENIE_FETCH_BLOCK nor GENIE_FETCH_BLOCK_HOSTS is set, so links to the home's own public address aren't blocked");
+
+/** Is this address anywhere but the public internet, or one of GENIE_FETCH_BLOCK_HOSTS's? (Anything that isn't an
+ *  address at all counts as blocked.) `home` is only ever swapped by check-unfurl.ts. */
+export function isBlockedAddress(address: string, home: HostBlock = HOME): boolean {
   const addr = address.split('%')[0];   // a zone id ("fe80::1%eth0") would make the lists miss the address
   const v = isIP(addr);
-  if (v === 4) return BLOCKED_V4.check(addr, 'ipv4');
-  if (v === 6) return !PUBLIC_V6.check(addr, 'ipv6') || BLOCKED_V6.check(addr, 'ipv6') || BLOCKED_V4.check(addr, 'ipv6');   // the last: a mapped v4 address
+  if (v === 4) return BLOCKED_V4.check(addr, 'ipv4') || home.has(addr, 4);
+  if (v === 6) return !PUBLIC_V6.check(addr, 'ipv6') || BLOCKED_V6.check(addr, 'ipv6') || BLOCKED_V4.check(addr, 'ipv6') || home.has(addr, 6);   // the third: a mapped v4 address
   return true;
 }
 
@@ -67,14 +177,14 @@ export function isBlockedAddress(address: string): boolean {
 const LAN_NAMES = ['localhost', 'local', 'internal', 'lan', 'arpa', 'localdomain', 'home', 'corp', 'intranet', 'private', 'test', 'invalid', 'example', 'onion'];
 
 /** The checks that need no lookup: http(s), no login, the normal ports, a public-looking name. Returns the bare host name. */
-function checkShape(url: URL): string {
+function checkShape(url: URL, home: HostBlock): string {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Blocked('scheme');
   if (url.username || url.password) throw new Blocked('login');
   if (url.port !== '' && url.port !== '80' && url.port !== '443') throw new Blocked('port');
   // the URL parser has already turned 2130706433, 0x7f.1 and 0177.0.0.1 into 127.0.0.1, and [::ffff:127.0.0.1] into [::ffff:7f00:1]
   const host = url.hostname.replace(/^\[(.*)\]$/, '$1').replace(/\.+$/, '').toLowerCase();
   if (isIP(host)) {
-    if (isBlockedAddress(host)) throw new Blocked('address');
+    if (isBlockedAddress(host, home)) throw new Blocked('address');
     return host;
   }
   // a name without a dot ("pve", "router") can only be a machine on the local network
@@ -88,6 +198,8 @@ export class Gate {
   private busy = 0;
   private readonly queue: (() => void)[] = [];
   constructor(private readonly size: number) {}
+  /** Nobody in it and nobody waiting. */
+  get idle() { return this.busy === 0 && !this.queue.length; }
   /** Waits for a turn (FetchFailed after `waitMs`) and returns the function that ends it. */
   async enter(waitMs: number): Promise<() => void> {
     if (this.busy < this.size) this.busy++;
@@ -110,6 +222,18 @@ export class Gate {
   }
 }
 const fetches = new Gate(4);
+
+// Each account gets one fetch at a time (a second add waits for the first, within the same 10 s), so a few accounts
+// pasting slow pages can't take every slot and leave everyone else's wishes named from their links.
+const accounts = new Map<string, Gate>();
+async function ownTurn(who: string, waitMs: number): Promise<() => void> {
+  let gate = accounts.get(who);
+  if (!gate) accounts.set(who, gate = new Gate(1));
+  const forget = () => { if (gate.idle && accounts.get(who) === gate) accounts.delete(who); };
+  let leave: () => void;
+  try { leave = await gate.enter(waitMs); } catch (e) { forget(); throw e; }
+  return () => { leave(); forget(); };
+}
 
 /** Rejects with FetchFailed('timeout') if `promise` hasn't settled by `by` (a Date.now() time). */
 function before<T>(promise: Promise<T>, by: number): Promise<T> {
@@ -144,15 +268,19 @@ async function resolve(host: string, by: number): Promise<Address[]> {
   }
 }
 
-export const vetUrl: Vet = async (url, by) => {
-  const host = checkShape(url);
+/** The real checks, against `home`'s addresses as well as the private ranges (only check-unfurl.ts passes another). */
+export const vetWith = (home: HostBlock): Vet => async (url, by) => {
+  const host = checkShape(url, home);
+  // GENIE_FETCH_BLOCK_HOSTS's addresses aren't known yet: fetch nothing rather than risk one of them
+  if (!home.ready) throw new FetchFailed('blocked addresses not known yet');
   if (isIP(host)) return { url, host, addresses: [{ address: host, family: isIP(host) }] };
   const found = await resolve(host, by);
   if (!found.length) throw new FetchFailed('no such site');
   // every address must pass: the connection could end up at any of them
-  if (found.some(a => isBlockedAddress(a.address))) throw new Blocked('address');
+  if (found.some(a => isBlockedAddress(a.address, home))) throw new Blocked('address');
   return { url, host, addresses: found };
 };
+export const vetUrl: Vet = vetWith(HOME);
 
 // ---------- fetching ----------
 export interface FetchOptions {
@@ -162,6 +290,16 @@ export interface FetchOptions {
   partial: boolean;
   /** The content types worth reading; anything else fails before its body is downloaded. Every type when left out. */
   types?: string[];
+  /** The account asking: it waits for its own earlier fetch to finish first (see ownTurn). */
+  who?: string;
+  /**
+   * Pages only (with `partial`): shown everything up to the first `</head>` once it has arrived (with the page's link
+   * and type), and reading stops there if it says that's enough. A slow or big page then holds one of the 4 slots for
+   * only as long as its <head> takes. Asked once, so a page full of `</head>`s can't make it run again and again.
+   */
+  enoughAtHead?: (head: Buffer, page: { url: string; contentType: string }) => boolean;
+  /** Gives up on a body that sends nothing at all for this long (with `partial`, what did arrive is kept). */
+  idleMs?: number;
 }
 export interface Fetched {
   /** The link that finally answered, after any redirects (no #fragment). */
@@ -172,14 +310,18 @@ export interface Fetched {
 }
 
 /**
- * GET a link from the public internet: at most 3 redirects (each checked again), 5 s for an answer, 8 s in all, and
- * never more than `maxBytes` (after decompression). No cookies are sent or kept. `vet` is only ever swapped by
- * check-unfurl.ts, to aim at its local test server.
+ * GET a link from the public internet: at most 3 redirects (each checked again), 5 s for an answer, 8 s in all (less
+ * with `idleMs` or `enoughAtHead`), and never more than `maxBytes` (after decompression). No cookies are sent or kept.
+ * `vet` is only ever swapped by check-unfurl.ts, to aim at its local test server.
  */
 export async function safeFetch(link: string, opts: FetchOptions, vet: Vet = vetUrl): Promise<Fetched> {
   let url: URL;
   try { url = new URL(link); } catch { throw new Blocked('scheme'); }
-  const leave = await fetches.enter(QUEUE_MS);
+  // waiting for this account's own turn and then for a slot share one 10 s
+  const queueBy = Date.now() + QUEUE_MS;
+  const leaveOwn = opts.who ? await ownTurn(opts.who, QUEUE_MS) : () => {};
+  let leave: () => void;
+  try { leave = await fetches.enter(Math.max(0, queueBy - Date.now())); } catch (e) { leaveOwn(); throw e; }
   let at: string | undefined;
   try {
     const by = Date.now() + TOTAL_MS;
@@ -201,7 +343,10 @@ export async function safeFetch(link: string, opts: FetchOptions, vet: Vet = vet
       if (opts.types && !opts.types.includes(contentType.split(';')[0].trim().toLowerCase())) { res.destroy(); throw new FetchFailed('wrong type'); }
       // a download that must be whole and says up front it's too big isn't downloaded at all
       if (!opts.partial && Number(res.headers['content-length']) > opts.maxBytes) { res.destroy(); throw new FetchFailed('too big'); }
-      const { body, truncated } = await readBody(res, opts.maxBytes, opts.partial, by);
+      const enough = opts.partial && opts.enoughAtHead;
+      const { body, truncated } = await readBody(res, opts.maxBytes, opts.partial, by, {
+        idleMs: opts.idleMs, enoughAtHead: enough ? head => enough(head, { url: url.href, contentType }) : undefined,
+      });
       return { url: url.href, contentType, body, truncated };
     }
   } catch (e) {
@@ -209,6 +354,7 @@ export async function safeFetch(link: string, opts: FetchOptions, vet: Vet = vet
     throw e;
   } finally {
     leave();
+    leaveOwn();
   }
 }
 
@@ -250,38 +396,67 @@ function open(t: Target, accept: string, by: number): Promise<IncomingMessage> {
 /** Does this deflate body start with a zlib header? (Some servers send raw deflate without one.) */
 const zlibHeader = (b: Buffer) => b.length < 2 || ((b[0] & 0x0f) === 8 && ((b[0] << 8) | b[1]) % 31 === 0);
 
-/** Reads (and decompresses) a body, never holding more than `max` bytes, compressed or not. */
-function readBody(res: IncomingMessage, max: number, partial: boolean, by: number): Promise<{ body: Buffer; truncated: boolean }> {
+// the end of a page's <head> (the character after it too, so "</header" doesn't count), found in the text as it arrives
+const HEAD_END = /<\/head[\s>]/i;
+
+/**
+ * Reads (and decompresses) a body, never holding more than `max` bytes, compressed or not. `idleMs`: gives up after
+ * that long with nothing arriving. `enoughAtHead`: see FetchOptions (the caller only passes it for pages).
+ */
+function readBody(res: IncomingMessage, max: number, partial: boolean, by: number,
+  { idleMs, enoughAtHead }: { idleMs?: number; enoughAtHead?: (head: Buffer) => boolean } = {}): Promise<{ body: Buffer; truncated: boolean }> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0, raw = 0, settled = false;
     let decoder: zlib.Gunzip | zlib.Inflate | zlib.InflateRaw | zlib.BrotliDecompress | null = null;
+    let idle: NodeJS.Timeout | undefined;
     const finish = (problem?: string) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(idle);
       res.destroy();
       decoder?.destroy();
       if (problem && !partial) reject(new FetchFailed(problem));
       else resolve({ body: Buffer.concat(chunks), truncated: !!problem });
     };
     const timer = setTimeout(() => finish('timeout'), Math.max(0, by - Date.now()));
+    /** Bytes arrived from the shop: the idle clock starts again. */
+    const alive = () => {
+      if (!idleMs || settled) return;
+      clearTimeout(idle);
+      idle = setTimeout(() => finish('stalled'), idleMs);
+    };
+    alive();
+    // looking for </head>: the last few characters of the text so far, in case it's split between two chunks
+    let tail = '', headLooked = !enoughAtHead;
+    const lookForHead = (chunk: Buffer, at: number) => {
+      const text = tail + chunk.toString('latin1');   // one character per byte, so positions match the bytes
+      const found = text.search(HEAD_END);
+      tail = text.slice(-6);
+      if (found < 0) return;
+      headLooked = true;
+      let enough = false;
+      try { enough = enoughAtHead!(Buffer.concat(chunks).subarray(0, at - (text.length - chunk.length) + found)); }
+      catch (e: any) { console.error(`fetch: checking a page's <head> failed: ${e?.stack ?? e}`); }   // a bug of ours: read on
+      if (enough) finish('enough in the <head>');
+    };
     const take = (chunk: Buffer) => {
       if (settled) return;
-      if (size + chunk.length > max) {
-        chunks.push(chunk.subarray(0, max - size));
-        size = max;
-        return finish('too big');
-      }
+      const tooBig = size + chunk.length > max;
+      if (tooBig) chunk = chunk.subarray(0, max - size);
       chunks.push(chunk);
+      const at = size;
       size += chunk.length;
+      if (!headLooked) lookForHead(chunk, at);
+      if (tooBig) finish('too big');
     };
     res.on('error', () => finish('cut off'));
     res.on('close', () => { if (!res.complete) finish('cut off'); });
 
     const encoding = String(res.headers['content-encoding'] ?? '').trim().toLowerCase();
     if (encoding === '' || encoding === 'identity') {
-      res.on('data', take);
+      res.on('data', (chunk: Buffer) => { alive(); take(chunk); });
       res.on('end', () => finish());
       return;
     }
@@ -289,6 +464,7 @@ function readBody(res: IncomingMessage, max: number, partial: boolean, by: numbe
     // the size limit applies to what comes out, so a small compressed "bomb" can't fill the memory
     res.on('data', (chunk: Buffer) => {
       if (settled) return;
+      alive();
       raw += chunk.length;
       if (raw > max) return finish('too big');
       if (!decoder) {

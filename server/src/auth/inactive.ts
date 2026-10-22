@@ -11,10 +11,13 @@
 // warning in the same run has gone out: a bad key or sending domain gives a 4xx too, and must never count as a warning.
 // Deleting an account takes its lists, wishes, grants, logins and trusted devices with it (the database cascades).
 // Runs once a day, a few minutes after start-up. Small batches, so a backlog is worked through over several days.
+// Warnings leave the last 30 of the day's emails (mailer.ts allows 80) for codes, so a backlog of warnings can't stop
+// anyone signing up or logging in; the rest wait for tomorrow's run.
 import { q } from '../db/index.ts';
-import { FOOTER, MAIL_READY, MailRefused, sendMail } from './mailer.ts';
+import { FOOTER, MAIL_DAILY_CAP, MAIL_READY, MailRefused, mailLeft, sendMail } from './mailer.ts';
 
 const WARN_BATCH = 50, DELETE_BATCH = 100;
+const KEEP_FOR_CODES = Math.min(30, Math.floor(MAIL_DAILY_CAP / 2));   // so a lower allowance still leaves room for warnings
 const MAIL_GAP_MS = 600;            // Resend accepts a couple of emails a second
 const MAX_MAIL_FAILURES = 3;        // in a row: email is down, so try the rest tomorrow
 const DAY_MS = 86400_000;
@@ -69,6 +72,10 @@ export async function inactiveSweep(): Promise<{ deleted: number; warned: number
     let failures = 0, sentOne = false;
     for (const [i, u] of due.entries()) {
       if (i) await new Promise(r => setTimeout(r, MAIL_GAP_MS));
+      if (mailLeft() <= KEEP_FOR_CODES) {
+        console.log(`inactive accounts: leaving today's last ${KEEP_FOR_CODES} emails for codes; ${due.length - i} warning(s) wait for tomorrow`);
+        break;
+      }
       try {
         const mail = warningMail(u.name, u.delete_from);
         await sendMail(u.email, mail.subject, mail.text);

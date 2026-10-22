@@ -1,7 +1,8 @@
 // The account API (under <base>/api): sign up, log in, codes, account settings. JSON in, JSON out.
 //
 // Changes must be POSTed JSON from this site (see http.ts), and rate limits slow down password guessing, code
-// guessing and code spamming (which also protects the Resend quota).
+// guessing and code spamming. Emails are checked before they go into a rate limit's key. The Resend allowance itself is
+// guarded by a daily cap on every email sent, with each visitor's own share of it (8 a day) checked first (mailer.ts).
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { DEV } from '../config.ts';
 import { cookie, cookies, clientIp, deviceLabel, Problem, readJson, sameOrigin, send, sendError, tooMany } from '../http.ts';
@@ -42,7 +43,14 @@ export async function accountRoutes(req: IncomingMessage, res: ServerResponse, r
       if (rel.startsWith('/api/account/email')) throw new Problem('Changing your email is switched off for a moment. Try again later.', 503);
     }
     const body = await readJson(req);
-    const email = A.normEmail(body.email);
+    /** The email sent, tidied and checked (a 400 if it isn't one), before it's used in any rate limit. */
+    const email = () => A.validEmail(body.email);
+    /** The same, for a code being checked, once the code-guess limits allow it. */
+    const guessFor = () => {
+      const e = email();
+      if (codeGuesses(ip, e)) throw tooMany();
+      return e;
+    };
     /** Start a login session in this browser (and trust it for 30 days if asked). */
     const login = async (userId: string, trust: boolean) => {
       const token = await A.createSession(userId, ua);
@@ -55,34 +63,34 @@ export async function accountRoutes(req: IncomingMessage, res: ServerResponse, r
     switch (rel) {
       // ----- signed out -----
       case '/api/auth/signup': {
-        const form = A.checkSignup(body.name, email, body.password);   // typing mistakes are cheap to refuse and don't count
-        if (limited(`signup:${ip}`, 10, 3600_000) || limited(`signup:${email}`, 3, 600_000)) throw tooMany();
-        await A.signupStart(form);
+        const form = A.checkSignup(body.name, body.email, body.password);   // typing mistakes are cheap to refuse and don't count
+        if (limited(`signup:${ip}`, 10, 3600_000) || limited(`signup:${form.email}`, 3, 600_000)) throw tooMany();
+        await A.signupStart(form, ip);
         send(res, 200, { ok: true });
         return true;
       }
       case '/api/auth/signup/verify':
-        if (codeGuesses(ip, email)) throw tooMany();
-        return await login(await A.signupVerify(email, body.code), true);
+        return await login(await A.signupVerify(guessFor(), body.code), true);
       case '/api/auth/login': {
+        const e = email();
         if (limited(`login:${ip}`, 30, 900_000)) throw tooMany();
         // a browser this account already trusts is almost certainly the owner's, so strangers' tries don't hold it up
-        if (!(await A.trustedFor(email, jar[DEVICE])) && (limited(`login:${email}:${ip}`, 8, 900_000) || limited(`login:${email}`, 100, 900_000))) throw tooMany();
-        const result = await A.loginStart(email, body.password, jar[DEVICE]);
+        if (!(await A.trustedFor(e, jar[DEVICE])) && (limited(`login:${e}:${ip}`, 8, 900_000) || limited(`login:${e}`, 100, 900_000))) throw tooMany();
+        const result = await A.loginStart(e, body.password, jar[DEVICE], ip);
         if ('needCode' in result) { send(res, 200, { ok: true, needCode: true }); return true; }
         return await login(result.userId, false);
       }
       case '/api/auth/login/verify':
-        if (codeGuesses(ip, email)) throw tooMany();
-        return await login(await A.loginVerify(email, body.code), body.trust === true);
-      case '/api/auth/forgot':
-        if (limited(`forgot:${ip}`, 10, 3600_000) || limited(`forgot:${email}:${ip}`, 3, 600_000) || limited(`forgot:${email}`, 30, 3600_000)) throw tooMany();
-        await A.forgotStart(email);
+        return await login(await A.loginVerify(guessFor(), body.code), body.trust === true);
+      case '/api/auth/forgot': {
+        const e = email();
+        if (limited(`forgot:${ip}`, 10, 3600_000) || limited(`forgot:${e}:${ip}`, 3, 600_000) || limited(`forgot:${e}`, 30, 3600_000)) throw tooMany();
+        await A.forgotStart(e, ip);
         send(res, 200, { ok: true });
         return true;
+      }
       case '/api/auth/forgot/verify':
-        if (codeGuesses(ip, email)) throw tooMany();
-        return await login(await A.forgotVerify(email, body.code, body.password), false);
+        return await login(await A.forgotVerify(guessFor(), body.code, body.password), false);
       case '/api/auth/logout':
         // the trusted-device cookie stays, so logging back in here doesn't need a code
         await A.endSession(jar[SESSION]);
@@ -109,10 +117,8 @@ export async function accountRoutes(req: IncomingMessage, res: ServerResponse, r
         await A.logoutEverywhere(me.id);
         return await login(me.id, trusted);
       }
-      case '/api/account/email': await A.changeEmailStart(me.id, body.email, body.password, me.email); break;
-      case '/api/account/email/verify':
-        if (codeGuesses(ip, email)) throw tooMany();
-        await A.changeEmailVerify(me.id, body.email, body.code, me.email); break;
+      case '/api/account/email': await A.changeEmailStart(me.id, body.email, body.password, me.email, ip); break;
+      case '/api/account/email/verify': await A.changeEmailVerify(me.id, guessFor(), body.code, me.email); break;
       case '/api/account/devices': {
         const mine = jar[DEVICE] ? sha256(jar[DEVICE]).slice(0, 12) : '';
         send(res, 200, { devices: (await A.listDevices(me.id)).map(d => ({ ...d, current: d.id === mine })) });
